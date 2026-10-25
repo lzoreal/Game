@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.cache
+
+# User catalogs and derived caches are local data, never committed
+sources/
+
+.venv/
+venv/
+.idea/
+.vscode/
