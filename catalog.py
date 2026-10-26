@@ -37,6 +37,59 @@ DEFAULT_HEADERS = {
 
 REPACK_KEYS = ['repacks', 'repack', 'games', 'items', 'downloads', 'sources']
 
+# Cloudflare-protected mirrors reject the default Python TLS fingerprint. When
+# ``curl_cffi`` is available we retry with real browser fingerprints so source
+# updates and downloads keep working without user interaction.
+IMPERSONATE_PROFILES = ("chrome", "safari", "firefox")
+CF_STATUS_CODES = (403, 429, 503)
+CF_BODY_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "cf-chl",
+    "cf_chl_opt",
+    "attention required",
+    "cf-mitigated",
+    "enable javascript and cookies to continue",
+)
+
+_CURL_CFFI = None
+_CURL_CFFI_CHECKED = False
+
+
+def curl_requests():
+    """Return ``curl_cffi.requests`` when installed, else ``None``."""
+    global _CURL_CFFI, _CURL_CFFI_CHECKED
+    if not _CURL_CFFI_CHECKED:
+        _CURL_CFFI_CHECKED = True
+        try:
+            from curl_cffi import requests as module
+        except Exception:
+            module = None
+        _CURL_CFFI = module
+    return _CURL_CFFI
+
+
+def is_cloudflare_challenge(status, headers, body):
+    """Best-effort detection of a Cloudflare interstitial/challenge response."""
+    if int(status or 0) not in CF_STATUS_CODES:
+        return False
+    header_text = " ".join(
+        f"{key}:{value}" for key, value in (headers or {}).items()
+    ).lower()
+    if "cloudflare" in header_text or "cf-mitigated" in header_text:
+        return True
+    if isinstance(body, (bytes, bytearray)):
+        snippet = body[:8192].decode("utf-8", "ignore")
+    else:
+        snippet = str(body or "")[:8192]
+    snippet = snippet.lower()
+    return any(marker in snippet for marker in CF_BODY_MARKERS)
+
+
+class CloudflareBlocked(RuntimeError):
+    """Raised when every browser fingerprint is still challenged."""
+
+
 _VERSION_RE = re.compile(r"\bv\d+(?:\.\d+)+\w*\b", re.I)
 _ORDINAL_RE = re.compile(r"(\d+)(?:st|nd|rd|th)\b", re.I)
 
@@ -491,6 +544,49 @@ class Downloader:
         parsed = urlparse(url)
         headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
 
+        module = curl_requests()
+        if module is not None:
+            return self._download_impersonated(module, url, headers, timeout)
+        return self._download_urllib(url, headers, timeout)
+
+    def _download_impersonated(self, module, url, headers, timeout):
+        blocked = []
+        for profile in IMPERSONATE_PROFILES:
+            try:
+                response = module.get(
+                    url,
+                    headers=headers,
+                    impersonate=profile,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    verify=False,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"下载失败: {exc}") from exc
+
+            body = response.content
+            if is_cloudflare_challenge(
+                response.status_code, response.headers, body
+            ):
+                blocked.append(profile)
+                continue
+            if response.status_code >= 400:
+                reason = response.reason or ""
+                raise RuntimeError(
+                    f"下载失败: HTTP {response.status_code} {reason}".strip()
+                )
+            try:
+                return body.decode("utf-8")
+            except ValueError as exc:
+                raise RuntimeError(f"下载失败: 响应内容无效: {exc}") from exc
+
+        raise CloudflareBlocked(
+            "下载失败: 目标站点启用了 Cloudflare 人机验证，"
+            f"已尝试 {' / '.join(blocked)} 浏览器指纹仍被拦截。"
+            "请在浏览器中打开该地址完成验证后重试，或改用直链。"
+        )
+
+    def _download_urllib(self, url, headers, timeout):
         request = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -499,6 +595,16 @@ class Downloader:
                     content = gzip.decompress(content)
                 return content.decode("utf-8")
         except urllib.error.HTTPError as exc:
+            body = b""
+            try:
+                body = exc.read(8192)
+            except Exception:
+                pass
+            if is_cloudflare_challenge(exc.code, exc.headers, body):
+                raise CloudflareBlocked(
+                    "下载失败: 目标站点启用了 Cloudflare 人机验证，"
+                    "自动绕过不可用。请安装 curl_cffi 或在浏览器中完成验证后重试。"
+                ) from exc
             raise RuntimeError(f"下载失败: HTTP {exc.code} {exc.reason}") from exc
         except (urllib.error.URLError, OSError) as exc:
             raise RuntimeError(f"下载失败: {exc}") from exc
