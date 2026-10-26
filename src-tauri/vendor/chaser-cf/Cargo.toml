@@ -1,0 +1,39 @@
+[package]
+edition = "2021"
+name = "chaser-cf"
+version = "0.2.1"
+authors = ["ccheshirecat"]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "High-performance Cloudflare bypass library with stealth browser automation. Rust-native with C FFI bindings."
+readme = "README.md"
+keywords = ["cloudflare", "turnstile", "stealth", "browser", "automation"]
+categories = ["api-bindings", "web-programming"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ccheshirecat/chaser-cf"
+
+# Local patch: ChaserConfig gains `user_data_dir` so callers can isolate browser
+# profiles. Everything else is upstream 0.2.1.
+
+[features]
+default = []
+
+[lib]
+name = "chaser_cf"
+crate-type = ["lib"]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+chaser-oxide = { version = "0.2.4", features = ["native-tls", "zip0"], default-features = false }
+futures = "0.3"
+rand = "0.9.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full", "sync", "rt-multi-thread"] }
+tracing = "0.1"
+url = "2"

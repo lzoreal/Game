@@ -23,7 +23,7 @@ use crate::storage;
 use crate::swarm;
 use crate::update::{self, UpdateResult};
 
-pub const APP_VERSION: &str = "v1.3.0";
+pub const APP_VERSION: &str = "v1.4.0";
 const DEBOUNCE_MS: u64 = 250;
 const RAW_LIMIT: usize = 100_000;
 

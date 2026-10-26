@@ -1,5 +1,6 @@
 pub mod bt;
 pub mod catalog;
+pub mod chaser;
 pub mod commands;
 pub mod dates;
 pub mod detail;
@@ -19,10 +20,21 @@ use std::sync::Arc;
 
 use tauri::{Emitter as _, Manager};
 
+use crate::chaser::ChaserSolver;
 use crate::net::Downloader;
 use crate::net_reqwest::ReqwestClient;
 use crate::platform::SystemPlatform;
 use crate::state::{AppState, Emitter};
+
+fn chaser_enabled() -> bool {
+    match std::env::var("GAMEMAGNET_CHASER") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
 
 fn cleanup_update_leftovers() {
     let Ok(exe) = std::env::current_exe() else {
@@ -50,8 +62,15 @@ pub fn run() {
             let emitter: Emitter = Arc::new(move |event, payload| {
                 let _ = handle.emit(event, payload);
             });
-            let client = ReqwestClient::new()?;
-            let downloader = Arc::new(Downloader::new(Arc::new(client)));
+            let client = Arc::new(ReqwestClient::new()?);
+            let downloader = if chaser_enabled() {
+                Arc::new(Downloader::with_solver(
+                    client,
+                    Arc::new(ChaserSolver::new()),
+                ))
+            } else {
+                Arc::new(Downloader::new(client))
+            };
             let state = AppState::new(
                 storage::sources_dir(),
                 downloader,

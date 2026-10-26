@@ -15,7 +15,7 @@
 - **模糊搜索**：关键词模糊匹配、相似度阈值、来源筛选与日期排序。
 - **详情面板**：文件大小、上传日期、来源、链接分类；复制链接、发送到 BT 客户端、查询做种热度（自动追加公共 tracker）、按需查看原始 JSON。
 - **源管理**：批量添加源（一行一个直链，失败行自动跳过，结束后统一汇总）、从本地导入 JSON、更新选中源、最多 4 路并行刷新全部源、删除源。
-- **Cloudflare 处理**：识别人机验证页面，提供「用浏览器打开」与本地导入的引导。
+- **Cloudflare 自动验证**：内置 chaser-cf，遇到人机验证时自动启动本机 Chrome/Edge 完成验证并重试；失败时仍提供「用浏览器打开」与本地导入的引导。
 - **应用内更新**：发现新版本后可下载 release 中的单文件 exe，校验 SHA-256 后自动备份、覆盖当前目录并重启；目录不可写时会提示改用安装包。
 - **明暗主题**：手动切换并记住选择，原生标题栏同步切换。
 - **快捷键**：`Ctrl+U` 添加源、`Ctrl+I` 导入 JSON、`F5` 刷新全部源、`Ctrl+K` / `Ctrl+F` 聚焦搜索、`Ctrl+B` 资料库、`Ctrl+D` 详情。
@@ -44,14 +44,26 @@
 
 ### Cloudflare 站点
 
-部分源站点启用了 Cloudflare。应用使用系统 TLS 发起请求，并识别人机验证页面：
+部分源站点启用了 Cloudflare。应用会先带浏览器风格请求头与三种浏览器指纹（Chrome / Safari / Firefox）直接请求；仍被拦截时，使用内嵌的 [chaser-cf](https://crates.io/crates/chaser-cf) 自动验证：
 
-- 常规请求会带上浏览器风格的请求头。
-- 需要浏览器执行 JavaScript 的托管质询（页面显示 “Just a moment...” / “请稍候…”）无法自动绕过。应用会识别并在对话框中提供「用浏览器打开」按钮与源地址。
-- 遇到这种站点时，可以：
-  1. 在浏览器中打开该地址完成验证，保存返回的 JSON，再通过「从本地导入 JSON」导入；
-  2. 改用不受保护的镜像直链；
-  3. 改用在浏览器中可正常访问的其他源。
+- 自动启动本机 Chrome 或 Edge（有可见窗口）完成托管质询，验证通过后直接由浏览器读取源 JSON，避免 HTTP 客户端与浏览器指纹不一致导致二次拦截。
+- 无感质询直接通过；需要点击的 Turnstile 会通过 CDP 穿透 shadow root / iframe 自动点击。
+- 验证并读取完成后自动关闭验证浏览器窗口；同一 profile 会复用已有 clearance，下次只需重新打开浏览器。
+- 每次启动验证浏览器时使用独立的临时浏览器 profile，退出时尝试清理，并在下次启动时清理过期目录；避免残留进程占用固定目录导致初始化失败。
+- 浏览器首次遇到验证时才启动，不会拖慢应用启动；多个源共享同一浏览器实例。
+- 单次验证可能需要 30–90 秒；默认超时 120 秒，可用 `CHASER_TIMEOUT`（毫秒）调整。
+- 需要本机安装 Chrome 或 Edge（Windows 会自动探测，Edge 回退可用）；可用 `CHROME_BIN` 指定浏览器路径，`CHASER_EXTRA_ARGS` 追加 Chrome 参数。
+- 托管质询在无头模式下通常无法通过，因此默认使用可见窗口（`CHASER_HEADLESS` 仅建议用于 Turnstile 场景）。
+- 如需完全关闭自动验证，设置环境变量 `GAMEMAGNET_CHASER=0`。
+- 并发上限默认 4 个浏览器上下文，可用 `CHASER_CONTEXT_LIMIT` 调整。
+
+自动验证失败时，应用仍会提示源地址，可以：
+
+1. 在浏览器中打开该地址完成验证，保存返回的 JSON，再通过「从本地导入 JSON」导入；
+2. 改用不受保护的镜像直链；
+3. 改用在浏览器中可正常访问的其他源。
+
+内嵌 chaser-cf 会增大安装包体积，但浏览器进程只在验证时启动。
 
 ## 从源码运行
 
@@ -97,7 +109,7 @@ node scripts/sync-version.mjs v1.2.0
 cargo test --lib --manifest-path src-tauri/Cargo.toml
 ```
 
-57 个 Rust 测试覆盖目录解析与去重、搜索与排序、gzip 存储、源命令、批量添加、详情模型、Tracker 热度、BT 交接、更新检查与应用状态流程。
+70 个 Rust 测试覆盖目录解析与去重、搜索与排序、gzip 存储、源命令、批量添加、详情模型、Tracker 热度、BT 交接、更新检查、Cloudflare 兜底与应用状态流程。
 
 ## 性能
 
@@ -118,6 +130,8 @@ cargo test --lib --manifest-path src-tauri/Cargo.toml
 | `src-tauri/src/storage.rs` | gzip 读写、原子写、源地址 sidecar |
 | `src-tauri/src/commands.rs` | 源目录写入：下载、添加、更新、导入、删除、刷新 |
 | `src-tauri/src/detail.rs` | 详情卡片与链接分组 |
+| `src-tauri/src/chaser.rs` | 内嵌 chaser-cf Cloudflare 自动验证与 cookie 提取 |
+| `src-tauri/vendor/chaser-cf/` | chaser-cf 0.2.1 本地副本（补丁：支持独立浏览器 profile） |
 | `src-tauri/src/swarm.rs` | bencode 解析与 HTTP/UDP tracker 热度查询 |
 | `src-tauri/src/bt.rs` | BT 客户端探测与交接计划 |
 | `src-tauri/src/update.rs` | GitHub Release 更新检查 |

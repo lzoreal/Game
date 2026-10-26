@@ -5,6 +5,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::chaser::CloudflareSolver;
+
 pub const IMPERSONATE_PROFILES: [&str; 3] = ["chrome", "safari", "firefox"];
 const CF_STATUS_CODES: [u16; 3] = [403, 429, 503];
 const CF_BODY_MARKERS: [&str; 9] = [
@@ -18,7 +20,7 @@ const CF_BODY_MARKERS: [&str; 9] = [
     "请稍候",
     "正在验证您是否是真人",
 ];
-pub const CF_BLOCKED_HINT: &str = "需要执行 JavaScript 的验证无法自动绕过：可在浏览器中打开该地址，保存返回的 JSON 后通过「从本地导入 JSON」导入；或改用其他镜像地址。";
+pub const CF_BLOCKED_HINT: &str = "自动验证未通过：可在浏览器中打开该地址，保存返回的 JSON 后通过「从本地导入 JSON」导入；或改用其他镜像地址。";
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -80,6 +82,20 @@ impl fmt::Display for NetError {
 
 impl std::error::Error for NetError {}
 
+fn finish(response: HttpResponse) -> Result<String, NetError> {
+    if response.status >= 400 {
+        let reason = response.reason.trim();
+        let message = if reason.is_empty() {
+            format!("下载失败: HTTP {}", response.status)
+        } else {
+            format!("下载失败: HTTP {} {reason}", response.status)
+        };
+        return Err(NetError::plain(message));
+    }
+    String::from_utf8(response.body)
+        .map_err(|error| NetError::plain(format!("下载失败: 响应内容无效: {error}")))
+}
+
 pub fn is_cloudflare_challenge(status: u16, headers: &HashMap<String, String>, body: &[u8]) -> bool {
     if !CF_STATUS_CODES.contains(&status) {
         return false;
@@ -126,11 +142,25 @@ pub fn referer_for(url: &str) -> String {
 
 pub struct Downloader {
     client: Arc<dyn HttpClient>,
+    solver: Option<Arc<dyn CloudflareSolver>>,
 }
 
 impl Downloader {
     pub fn new(client: Arc<dyn HttpClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            solver: None,
+        }
+    }
+
+    pub fn with_solver(
+        client: Arc<dyn HttpClient>,
+        solver: Arc<dyn CloudflareSolver>,
+    ) -> Self {
+        Self {
+            client,
+            solver: Some(solver),
+        }
     }
 
     pub fn download_json(&self, url: &str) -> Result<String, NetError> {
@@ -151,23 +181,24 @@ impl Downloader {
                 blocked.push(profile);
                 continue;
             }
-            if response.status >= 400 {
-                let reason = response.reason.trim();
-                let message = if reason.is_empty() {
-                    format!("下载失败: HTTP {}", response.status)
-                } else {
-                    format!("下载失败: HTTP {} {reason}", response.status)
-                };
-                return Err(NetError::plain(message));
+            return finish(response);
+        }
+
+        let mut solver_note = String::new();
+        if let Some(solver) = self.solver.as_ref() {
+            match solver.fetch(url) {
+                Ok(body) => return Ok(body),
+                Err(error) => {
+                    solver_note = format!("；chaser-cf 自动验证失败: {error}");
+                }
             }
-            return String::from_utf8(response.body)
-                .map_err(|error| NetError::plain(format!("下载失败: 响应内容无效: {error}")));
         }
 
         Err(NetError {
             message: format!(
-                "下载失败: 目标站点启用了 Cloudflare 人机验证，已尝试 {} 浏览器指纹仍被拦截。{CF_BLOCKED_HINT}",
-                blocked.join(" / ")
+                "下载失败: 目标站点启用了 Cloudflare 人机验证，已尝试 {} 浏览器指纹仍被拦截{}{CF_BLOCKED_HINT}",
+                blocked.join(" / "),
+                solver_note
             ),
             cloudflare_url: Some(url.to_string()),
         })
@@ -244,6 +275,27 @@ mod tests {
                 .unwrap()
                 .push(profile.map(str::to_string));
             self.responses.lock().unwrap().remove(0)
+        }
+    }
+
+    struct FakeSolver {
+        bodies: Mutex<Vec<Result<String, String>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeSolver {
+        fn new(bodies: Vec<Result<String, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                bodies: Mutex::new(bodies),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl CloudflareSolver for FakeSolver {
+        fn fetch(&self, url: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push(url.to_string());
+            self.bodies.lock().unwrap().remove(0)
         }
     }
 
@@ -325,5 +377,60 @@ mod tests {
             .unwrap_err();
         assert!(error.message.contains("HTTP 404"));
         assert_eq!(client.seen_profiles.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn solver_body_used_after_profiles_blocked() {
+        let client = ScriptedClient::new(vec![
+            Ok(challenge()),
+            Ok(challenge()),
+            Ok(challenge()),
+        ]);
+        let solver = FakeSolver::new(vec![Ok(r#"{"downloads": []}"#.to_string())]);
+        let downloader = Downloader::with_solver(client.clone(), solver.clone());
+
+        let body = downloader
+            .download_json("https://mirror.example/list.json")
+            .unwrap();
+
+        assert_eq!(body, r#"{"downloads": []}"#);
+        assert_eq!(
+            solver.calls.lock().unwrap().clone(),
+            vec!["https://mirror.example/list.json".to_string()]
+        );
+        assert_eq!(client.seen_profiles.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn solver_not_called_when_profile_succeeds() {
+        let client = ScriptedClient::new(vec![Ok(response(200, r#"{"downloads": []}"#))]);
+        let solver = FakeSolver::new(vec![]);
+        let downloader = Downloader::with_solver(client, solver.clone());
+
+        downloader
+            .download_json("https://mirror.example/list.json")
+            .unwrap();
+
+        assert!(solver.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn solver_failure_keeps_cloudflare_hint() {
+        let client = ScriptedClient::new(vec![
+            Ok(challenge()),
+            Ok(challenge()),
+            Ok(challenge()),
+        ]);
+        let solver = FakeSolver::new(vec![Err("未找到 Chrome".to_string())]);
+        let downloader = Downloader::with_solver(client, solver);
+
+        let error = downloader
+            .download_json("https://mirror.example/list.json")
+            .unwrap_err();
+
+        assert!(error.is_cloudflare());
+        assert!(error.message.contains("chaser-cf"));
+        assert!(error.message.contains("未找到 Chrome"));
+        assert!(error.message.contains("从本地导入"));
     }
 }
