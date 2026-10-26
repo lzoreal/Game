@@ -156,6 +156,11 @@ Canvas {
             ctx.beginPath()
             ctx.moveTo(5, 12.5); ctx.lineTo(9.2, 16.5); ctx.lineTo(19, 6.5)
             ctx.stroke()
+        } else if (name === "panel") {
+            ctx.strokeRect(4, 5.5, 16, 13)
+            ctx.beginPath()
+            ctx.moveTo(10, 5.5); ctx.lineTo(10, 18.5)
+            ctx.stroke()
         }
     }
 }

@@ -18,6 +18,7 @@ ApplicationWindow {
     background: Rectangle { color: theme.colors.window }
 
     property bool detailsOpen: true
+    property bool sidebarOpen: true
 
     function openUpdateDialog() {
         if (backend.activeSource.length > 0) {
@@ -51,6 +52,7 @@ ApplicationWindow {
     Shortcut { sequence: "Ctrl+I"; onActivated: importDialog.open() }
     Shortcut { sequence: "F5"; onActivated: backend.refresh_all() }
     Shortcut { sequence: "Ctrl+D"; onActivated: appWindow.detailsOpen = !appWindow.detailsOpen }
+    Shortcut { sequence: "Ctrl+B"; onActivated: appWindow.sidebarOpen = !appWindow.sidebarOpen }
     Shortcut { sequence: "Ctrl+K"; onActivated: topBar.focusSearch() }
     Shortcut { sequence: "Ctrl+F"; onActivated: topBar.focusSearch() }
 
@@ -61,6 +63,8 @@ ApplicationWindow {
         TopBar {
             id: topBar
             Layout.fillWidth: true
+            sidebarOpen: appWindow.sidebarOpen
+            onSidebarToggleRequested: appWindow.sidebarOpen = !appWindow.sidebarOpen
             onUpdateRequested: appWindow.openUpdateDialog()
             onDeleteRequested: appWindow.openDeleteDialog()
             onAboutRequested: aboutDialog.open()
@@ -74,15 +78,18 @@ ApplicationWindow {
 
             Sidebar {
                 id: sidebar
+                visible: appWindow.sidebarOpen
                 Layout.fillHeight: true
                 onAddRequested: addDialog.open()
                 onImportRequested: importDialog.open()
                 onRefreshRequested: backend.refresh_all()
                 onUpdateRequested: appWindow.openUpdateDialog()
                 onDeleteRequested: appWindow.openDeleteDialog()
+                onCloseRequested: appWindow.sidebarOpen = false
             }
 
             ResultsView {
+                objectName: "resultsView"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
             }

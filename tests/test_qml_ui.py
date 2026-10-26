@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from PySide6.QtCore import QObject, QPoint, QPointF, Qt, QUrl
+    from PySide6.QtCore import QMetaObject, QObject, QPoint, QPointF, Qt, QUrl
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtQml import QQmlApplicationEngine, QQmlExpression
     from PySide6.QtQuickControls2 import QQuickStyle
@@ -238,6 +238,40 @@ class QmlUiTests(unittest.TestCase):
         # Basic 样式用 palette.light 作选中背景、palette.windowText 作文字色，
         # 两者对比度必须足够，否则深色主题下选中项文字会看不见。
         self.assertGreater(contrast_ratio(light.name(), window_text.name()), 4.5)
+
+    def test_sidebar_closes_and_reopens(self):
+        sidebar = self.window.findChild(QObject, "sidebar")
+        close_button = self.window.findChild(QObject, "sidebarClose")
+        toggle = self.window.findChild(QObject, "sidebarToggle")
+        self.assertIsNotNone(sidebar)
+        self.assertIsNotNone(close_button)
+        self.assertIsNotNone(toggle)
+        self.assertTrue(sidebar.property("visible"))
+        self.assertEqual(sidebar.property("width"), 232)
+        results = self.window.findChild(QObject, "resultsView")
+        self.assertIsNotNone(results)
+        open_width = results.property("width")
+
+        self.assertTrue(QMetaObject.invokeMethod(close_button, "clicked"))
+        self.assertTrue(
+            self.wait_until(
+                lambda: not sidebar.property("visible")
+                and results.property("width") > open_width
+            ),
+            "close button did not hide the sidebar or reclaim its space",
+        )
+        self.assertFalse(self.window.property("sidebarOpen"))
+
+        self.window.setProperty("sidebarOpen", True)
+        self.assertTrue(self.wait_until(lambda: sidebar.property("visible")))
+        self.assertEqual(sidebar.property("width"), 232)
+
+        self.assertTrue(QMetaObject.invokeMethod(toggle, "clicked"))
+        self.assertTrue(
+            self.wait_until(lambda: not sidebar.property("visible")),
+            "top bar toggle did not hide the sidebar",
+        )
+        self.assertFalse(self.window.property("sidebarOpen"))
 
     def test_sidebar_library_collapses(self):
         sidebar = self.window.findChild(QObject, "sidebar")

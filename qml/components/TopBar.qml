@@ -9,6 +9,9 @@ Rectangle {
     signal deleteRequested()
     signal aboutRequested()
     signal btRequested()
+    signal sidebarToggleRequested()
+
+    property bool sidebarOpen: true
 
     height: 62
     color: theme.colors.window
@@ -79,6 +82,21 @@ Rectangle {
                     font.pixelSize: 11
                 }
             }
+        }
+
+        AppButton {
+            objectName: "sidebarToggle"
+            Layout.alignment: Qt.AlignVCenter
+            width: 34
+            height: 34
+            implicitWidth: 34
+            implicitHeight: 34
+            kind: "ghost"
+            iconName: "panel"
+            iconSize: 17
+            ToolTip.visible: hovered
+            ToolTip.text: bar.sidebarOpen ? "隐藏资料库 (Ctrl+B)" : "显示资料库 (Ctrl+B)"
+            onClicked: bar.sidebarToggleRequested()
         }
 
         Item { Layout.fillWidth: true }
@@ -299,6 +317,10 @@ Rectangle {
         MenuItem {
             text: "聚焦搜索框"
             onTriggered: bar.focusSearch()
+        }
+        MenuItem {
+            text: (bar.sidebarOpen ? "隐藏" : "显示") + "资料库"
+            onTriggered: bar.sidebarToggleRequested()
         }
         MenuSeparator {}
         MenuItem {

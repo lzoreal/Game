@@ -12,6 +12,7 @@ Rectangle {
     signal importRequested()
     signal refreshRequested()
     signal deleteRequested()
+    signal closeRequested()
 
     width: 232
     color: theme.colors.sidebar
@@ -102,6 +103,19 @@ Rectangle {
                 ToolTip.visible: hovered
                 ToolTip.text: "添加源"
                 onClicked: sidebar.addRequested()
+            }
+            AppButton {
+                objectName: "sidebarClose"
+                width: 28
+                height: 28
+                implicitWidth: 28
+                implicitHeight: 28
+                kind: "ghost"
+                iconName: "close"
+                iconSize: 14
+                ToolTip.visible: hovered
+                ToolTip.text: "关闭资料库 (Ctrl+B)"
+                onClicked: sidebar.closeRequested()
             }
         }
 
