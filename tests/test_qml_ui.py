@@ -123,6 +123,32 @@ class QmlUiTests(unittest.TestCase):
         self.assertEqual(self.backend.pageTitle, "sample")
         self.assertEqual(self.backend.scopeText, "sample")
 
+    def test_empty_query_shows_latest_games_by_default(self):
+        self.assertTrue(
+            self.wait_until(
+                lambda: len(self.backend.library.metas) == 1
+                and not self.backend.tasks.busy()
+            )
+        )
+        self.assertEqual(self.backend.query, "")
+        self.assertTrue(
+            self.wait_until(lambda: self.backend.resultsModel.rowCount() == 1),
+            "default latest listing did not populate",
+        )
+        self.assertEqual(self.backend.countText, "共 1 组")
+        self.assertFalse(self.backend.hasDetail)
+
+        self.backend.select_result(0)
+        self.assertTrue(self.backend.hasDetail)
+
+        self.backend.set_query("")
+        self.assertTrue(
+            self.wait_until(lambda: not self.backend.hasDetail),
+            "clearing the query did not return to the latest listing",
+        )
+        self.assertEqual(self.backend.resultsModel.rowCount(), 1)
+        self.assertEqual(self.backend.countText, "共 1 组")
+
     def test_update_task_kinds_dispatch_separately(self):
         calls = []
         self.backend.on_updated = lambda change: calls.append(("source", change))

@@ -14,12 +14,14 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from difflib import SequenceMatcher
+from functools import lru_cache
 from urllib.parse import urlparse
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
 APP_VERSION = "v1.0"
 MAX_RESULTS = 1000
+LATEST_LIMIT = 100
 SOURCE_URL_SUFFIX = ".source-url"
 
 DEFAULT_HEADERS = {
@@ -107,6 +109,17 @@ def clean_html(text):
 
 
 def parse_upload_date(value):
+    if isinstance(value, str):
+        return _parse_date_cached(value)
+    return _parse_upload_date(value)
+
+
+@lru_cache(maxsize=65536)
+def _parse_date_cached(value):
+    return _parse_upload_date(value)
+
+
+def _parse_upload_date(value):
     if value is None:
         return None
 
@@ -430,6 +443,45 @@ def search_items(items, query, fuzzy, min_similarity, source_filter, limit=MAX_R
     result = [finalize_group(groups[k]) for k in ranked[:limit]]
     result.sort(key=lambda g: (g["score"], g["date_dt"] or datetime.min), reverse=True)
     return result, total
+
+
+def latest_items(items, source_filter="", limit=LATEST_LIMIT):
+    """Group all items and return the newest groups, newest first.
+
+    Used as the default listing when the search box is empty. Two passes are
+    used so only the newest ``limit`` groups are built and finalized, which
+    keeps large catalogs responsive.
+    """
+    newest = {}
+
+    for item in items:
+        if source_filter and item["source_display"] != source_filter:
+            continue
+        key = item["dkey"] or item["nt"]
+        date_dt = parse_upload_date(item["uploadDate"])
+        if date_dt is None:
+            if key not in newest:
+                newest[key] = None
+        else:
+            current = newest.get(key)
+            if current is None or date_dt > current:
+                newest[key] = date_dt
+
+    total = len(newest)
+    keys = sorted(
+        newest, key=lambda key: newest[key] or datetime.min, reverse=True
+    )[:limit]
+    selected = set(keys)
+    groups = {key: {"items": [], "score": 0.0} for key in keys}
+
+    for item in items:
+        if source_filter and item["source_display"] != source_filter:
+            continue
+        key = item["dkey"] or item["nt"]
+        if key in selected:
+            groups[key]["items"].append(item)
+
+    return [finalize_group(groups[key]) for key in keys], total
 
 
 class Downloader:

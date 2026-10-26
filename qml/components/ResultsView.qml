@@ -389,16 +389,20 @@ Item {
                         }
                         Text {
                             Layout.alignment: Qt.AlignHCenter
-                            text: backend.query.length > 0 ? "没有找到结果" : "搜索游戏"
+                            text: (backend.busy || backend.latestLoading)
+                                  ? "正在加载游戏…"
+                                  : (backend.query.length > 0 ? "没有找到结果" : "暂无游戏")
                             color: theme.colors.empty_title
                             font.pixelSize: 16
                             font.weight: 500
                         }
                         Text {
                             Layout.alignment: Qt.AlignHCenter
-                            text: backend.query.length > 0
-                                  ? "试试更短的关键词，或切换来源"
-                                  : "输入关键词，从 " + (backend.sources.length > 0 ? backend.sources[0].count.toLocaleString() : "0") + " 个游戏中查找"
+                            text: (backend.busy || backend.latestLoading)
+                                  ? "首次读取全部来源可能需要几秒，请稍候。"
+                                  : (backend.query.length > 0
+                                     ? "试试更短的关键词，或切换来源"
+                                     : "添加或刷新源后，这里会显示最新的游戏。")
                             color: theme.colors.muted
                             font.pixelSize: 11
                             horizontalAlignment: Text.AlignHCenter

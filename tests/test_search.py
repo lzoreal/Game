@@ -43,6 +43,12 @@ class SearchControllerTests(unittest.TestCase):
         ticket = controller.begin("game", now=100.0)
         self.assertAlmostEqual(controller.elapsed_ms(ticket, now=100.25), 250.0)
 
+    def test_invalidate_cancels_in_flight_search(self):
+        controller = SearchController()
+        ticket = controller.begin("game", now=1.0)
+        controller.invalidate()
+        self.assertFalse(controller.accepts(ticket.token))
+
     def test_date_sort_defaults_to_newest_and_keeps_undated_last(self):
         controller = SearchController()
         newest = dated(datetime(2024, 3, 1))

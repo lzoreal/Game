@@ -50,6 +50,10 @@ class SearchController:
     def accepts(self, token):
         return token == self.token
 
+    def invalidate(self):
+        """Cancel any in-flight search without issuing a new ticket."""
+        self.token += 1
+
     def elapsed_ms(self, ticket, now=None):
         end = time.perf_counter() if now is None else now
         return (end - ticket.started) * 1000

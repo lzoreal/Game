@@ -21,3 +21,7 @@ def search_sources(items, query, fuzzy, min_similarity, source_filter,
     )
 
 
+def latest_sources(items, source_filter="", limit=core.LATEST_LIMIT):
+    return core.latest_items(items, source_filter, limit)
+
+

@@ -83,6 +83,7 @@ class ResultsModel(QAbstractListModel):
 
 
 class Backend(QObject):
+    latestLoadingChanged = Signal()
     sourcesChanged = Signal()
     sourcesCountChanged = Signal()
     pageChanged = Signal()
@@ -118,6 +119,11 @@ class Backend(QObject):
         self.tasks.changed.connect(self.on_tasks_changed)
 
         self._query = ""
+        self._latest_wanted = None
+        self._latest_inflight = set()
+        self._latest_cache = {}
+        self._latest_gen = 0
+        self._latest_loading = False
         self._fuzzy = True
         self._threshold = 0.3
         self._active_source = ""
@@ -225,6 +231,10 @@ class Backend(QObject):
     def busy(self):
         return self.tasks.busy()
 
+    @Property(bool, notify=latestLoadingChanged)
+    def latestLoading(self):
+        return self._latest_loading
+
     @Property(str, notify=queryChanged)
     def query(self):
         return self._query
@@ -318,6 +328,11 @@ class Backend(QObject):
             return
         preserve = self._active_source
         self.library.reset()
+        self._latest_gen += 1
+        self._latest_cache.clear()
+        self._latest_inflight.clear()
+        self._latest_wanted = None
+        self._set_latest_loading(False)
         self.results.set_groups([])
         self._groups = []
         self._selected_group = None
@@ -362,6 +377,8 @@ class Backend(QObject):
             self.on_loaded(result[0] if result else [])
         elif kind == "search":
             self.on_search_done(*result)
+        elif kind == "latest":
+            self.on_latest_done(*result)
         elif kind == "fetch_add":
             self.on_fetched(result)
         elif kind == "add":
@@ -383,6 +400,12 @@ class Backend(QObject):
     def on_failed(self, kind, error):
         self.update_busy()
         self.status = self.ready_status()
+        if kind == "latest":
+            self._latest_inflight.clear()
+            self._latest_wanted = None
+            self._set_latest_loading(False)
+            self.toastRequested.emit(f"读取最新游戏失败：{error}")
+            return
         if kind in ("fetch_add", "add"):
             self._pending_fetched = None
         if kind in ("search", "swarm", "check_update"):
@@ -413,7 +436,7 @@ class Backend(QObject):
         if self._query:
             self.run_search()
         else:
-            self._clear_results()
+            self.run_latest()
         self.update_busy()
 
     # -------------------------------------------------------------- search
@@ -423,7 +446,7 @@ class Backend(QObject):
         self.queryChanged.emit()
         if not self._query:
             self.search_timer.stop()
-            self._clear_results()
+            self.run_latest()
             return
         self.status = "正在搜索…"
         self.search_timer.start()
@@ -456,9 +479,11 @@ class Backend(QObject):
         if self._query:
             self.search_timer.start()
         else:
-            self._clear_results()
+            self.run_latest()
 
     def run_search(self):
+        self._latest_wanted = None
+        self._set_latest_loading(False)
         self.search_timer.stop()
         if not self._query or not self.library.items:
             self._clear_results()
@@ -506,7 +531,78 @@ class Backend(QObject):
             self._clear_detail()
         self.update_busy()
 
+    def _set_latest_loading(self, value):
+        value = bool(value)
+        if value != self._latest_loading:
+            self._latest_loading = value
+            self.latestLoadingChanged.emit()
+
+    def run_latest(self):
+        self.search_timer.stop()
+        self.search_ctl.invalidate()
+        if not self.library.items:
+            self._clear_results()
+            return
+        source_filter = self.scopeText if self._active_source else ""
+        cache_key = self._active_source
+        cached = self._latest_cache.get(cache_key)
+        if cached is not None:
+            self._latest_wanted = cache_key
+            self._set_latest_loading(False)
+            self._apply_latest(*cached)
+            return
+        if cache_key in self._latest_inflight:
+            self._latest_wanted = cache_key
+            self._set_latest_loading(True)
+            return
+
+        self._clear_results()
+        self._latest_wanted = cache_key
+        gen = self._latest_gen
+        items = self.library.items
+
+        def task(report):
+            return (
+                gen,
+                cache_key,
+                *task_lib.latest_sources(items, source_filter, core.LATEST_LIMIT),
+            )
+
+        self._latest_inflight.add(cache_key)
+        self._set_latest_loading(True)
+        self.tasks.submit("latest", task)
+
+    def on_latest_done(self, gen, cache_key, groups, total):
+        if gen != self._latest_gen:
+            return
+        self._latest_inflight.discard(cache_key)
+        self._latest_cache[cache_key] = (groups, total)
+        if self._query or cache_key != self._latest_wanted:
+            return
+        self._set_latest_loading(False)
+        self._apply_latest(groups, total)
+
+    def _apply_latest(self, groups, total):
+        self._groups = groups
+        self.results.set_groups(groups)
+        shown = len(groups)
+        if total > shown:
+            self._count_text = f"显示最新 {shown:,} 组 · 共 {total:,} 组"
+        else:
+            self._count_text = f"共 {total:,} 组"
+        self._elapsed_text = ""
+        self._selected_index = -1
+        self._selected_group = None
+        self.selectedResultIndexChanged.emit()
+        self._clear_detail()
+        self.pageChanged.emit()
+        self.status = self.ready_status()
+        self.update_busy()
+
     def _clear_results(self):
+        self._latest_wanted = None
+        self._set_latest_loading(False)
+        self.search_ctl.invalidate()
         self.results.set_groups([])
         self._groups = []
         self._selected_index = -1
@@ -525,8 +621,8 @@ class Backend(QObject):
             groups = self.search_ctl.apply_sort(self._groups)
             self._groups = groups
             self.results.set_groups(groups)
-            self._selected_index = -1
-            self.select_result(0)
+            if self._selected_index >= 0:
+                self.select_result(0)
         self.sortDescChanged.emit()
 
     # ------------------------------------------------------------- details
