@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GameMagNet 游戏目录管理器</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">G</div>
+        <div class="brand-text">
+          <div class="brand-title">GameMagNet</div>
+          <div class="brand-sub">游戏目录</div>
+        </div>
+      </div>
+
+      <button id="sidebarToggle" class="icon-btn" title="隐藏资料库 (Ctrl+B)"></button>
+      <div class="flex-fill"></div>
+
+      <div class="searchbox" id="searchBox">
+        <span class="search-icon" id="searchIcon"></span>
+        <input id="searchInput" type="text" placeholder="搜索游戏名称、来源…" autocomplete="off" spellcheck="false" />
+        <button id="clearSearch" class="icon-btn tiny hidden" title="清空"></button>
+        <kbd class="search-kbd">Ctrl K</kbd>
+      </div>
+
+      <div class="flex-fill"></div>
+
+      <div class="topbar-actions">
+        <button id="themeToggle" class="icon-btn" title="切换主题"></button>
+        <button id="moreButton" class="icon-btn" title="更多操作"></button>
+        <div class="vsep"></div>
+      </div>
+    </header>
+
+    <div class="body">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-head">
+          <button class="sidebar-collapse" id="sidebarCollapse">
+            <span class="chev" id="sidebarChev"></span>
+            <span class="sidebar-label">资料库</span>
+          </button>
+          <span class="pill" id="sourceCount">0</span>
+          <div class="flex-fill"></div>
+          <button class="icon-btn small" id="addSourceBtn" title="添加源"></button>
+          <button class="icon-btn small" id="closeSidebarBtn" title="关闭资料库 (Ctrl+B)"></button>
+        </div>
+
+        <div class="source-list" id="sourceList"></div>
+
+        <div class="sidebar-foot">
+          <button class="btn primary grow" id="addSourceBtn2">
+            <span class="ico" data-icon="plus"></span><span>添加源</span>
+          </button>
+          <button class="icon-btn" id="importBtn" title="从本地导入 JSON"></button>
+          <button class="icon-btn" id="refreshBtn" title="刷新全部源"></button>
+        </div>
+      </aside>
+
+      <main class="results">
+        <div class="results-head">
+          <div class="results-titles">
+            <h1 id="pageTitle">全部游戏</h1>
+            <p id="pageSub">正在加载源…</p>
+          </div>
+          <div class="flex-fill"></div>
+          <button class="btn soft hidden" id="expandDetailsBtn">
+            <span class="ico" data-icon="grid"></span><span>展开详情</span>
+          </button>
+        </div>
+
+        <div class="filters">
+          <button class="btn filter" id="fuzzyBtn">
+            <span class="ico" data-icon="check"></span><span>模糊匹配</span>
+          </button>
+          <span class="filter-label">阈值</span>
+          <div class="stepper">
+            <button class="step-btn" id="thresholdMinus">−</button>
+            <span class="step-value" id="thresholdValue">0.3</span>
+            <button class="step-btn" id="thresholdPlus">+</button>
+          </div>
+          <div class="flex-fill"></div>
+          <button class="btn ghost small" id="sortBtn" title="切换上传日期排序">最新在前 ↓</button>
+        </div>
+
+        <div class="table-card">
+          <div class="table-title">
+            <span class="table-title-text">搜索结果</span>
+            <div class="flex-fill"></div>
+            <span class="table-meta" id="resultMeta"></span>
+          </div>
+
+          <div class="table-head">
+            <div class="col-title">游戏名称</div>
+            <div class="col-source">来源</div>
+            <div class="col-size">大小</div>
+            <div class="col-date" id="dateHeader">
+              <span>上传日期</span>
+              <span class="sort-chev" id="sortChev"></span>
+            </div>
+            <div class="col-links">链接</div>
+          </div>
+
+          <div class="rows-wrap">
+            <div class="rows" id="rows"></div>
+            <div class="empty" id="emptyState">
+              <span class="empty-icon" data-icon="search"></span>
+              <div class="empty-title" id="emptyTitle">正在加载游戏…</div>
+              <div class="empty-sub" id="emptySub">首次读取全部来源可能需要几秒，请稍候。</div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <aside class="detail-pane" id="detailPane">
+        <div class="detail-card">
+          <div class="detail-head">
+            <span class="detail-head-label">游戏详情</span>
+            <div class="flex-fill"></div>
+            <span class="detail-hint" id="detailHint"></span>
+            <button class="icon-btn small" id="closeDetailBtn" title="收起详情"></button>
+          </div>
+
+          <div class="detail-body" id="detailBody"></div>
+
+          <div class="detail-empty" id="detailEmpty">
+            <span class="empty-icon" data-icon="grid"></span>
+            <div class="detail-empty-title">选择一个游戏</div>
+            <div class="detail-empty-sub">点击搜索结果查看来源与下载链接</div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <footer class="statusbar">
+      <span class="status-dot"></span>
+      <span class="status-text" id="statusText">正在加载源…</span>
+      <div class="flex-fill"></div>
+      <span class="status-version" id="statusVersion">v1.1 · 本地目录</span>
+    </footer>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <div class="menu-layer" id="menuLayer"></div>
+  <div class="modal-layer" id="modalLayer"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

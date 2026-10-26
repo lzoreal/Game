@@ -1,17 +1,12 @@
-__pycache__/
-*.py[cod]
-*.bak
-*.cache
+# Node / Tauri build output
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+dist/
 
-# User catalogs and derived caches are local data, never committed
+# Local catalogs are user data and are never committed
 sources/
 
-.venv/
-venv/
 .idea/
 .vscode/
-
-# PyInstaller output
-build/
-dist/
-/GameMagNet.exe
+*.bak
