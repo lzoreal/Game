@@ -43,7 +43,7 @@ class SearchControllerTests(unittest.TestCase):
         ticket = controller.begin("game", now=100.0)
         self.assertAlmostEqual(controller.elapsed_ms(ticket, now=100.25), 250.0)
 
-    def test_date_sort_persists_and_keeps_undated_last(self):
+    def test_date_sort_defaults_to_newest_and_keeps_undated_last(self):
         controller = SearchController()
         newest = dated(datetime(2024, 3, 1))
         middle = dated(datetime(2024, 2, 1))
@@ -51,18 +51,19 @@ class SearchControllerTests(unittest.TestCase):
         undated = dated(None)
         groups = [oldest, undated, newest, middle]
 
-        self.assertEqual(controller.apply_sort(groups), groups)
+        self.assertEqual(
+            controller.apply_sort(groups), [newest, middle, oldest, undated]
+        )
         self.assertEqual(groups[0], oldest)
 
         controller.toggle_date_sort()
         self.assertEqual(
-            controller.apply_sort(groups), [newest, middle, oldest, undated]
+            controller.apply_sort(groups), [oldest, middle, newest, undated]
         )
-        self.assertEqual(controller.apply_sort(groups), [newest, middle, oldest, undated])
 
         controller.toggle_date_sort()
         self.assertEqual(
-            controller.apply_sort(groups), [oldest, middle, newest, undated]
+            controller.apply_sort(groups), [newest, middle, oldest, undated]
         )
 
     def test_sort_by_date_does_not_mutate_input(self):

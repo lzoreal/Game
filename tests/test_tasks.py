@@ -1,4 +1,3 @@
-import json
 import os
 import shutil
 import sys
@@ -13,8 +12,7 @@ import hydra_tasks
 
 def write_source(path, title, uri):
     data = {"downloads": [{"title": title, "uris": [uri]}]}
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle)
+    hydra_core.write_source_file(path, data)
     return data
 
 
@@ -32,18 +30,18 @@ def search_item(title, source="test"):
 
 class TaskTestBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="hydra_task_test_")
+        self.tmp = tempfile.mkdtemp(prefix="gamemagnet_task_test_")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 class LoadTaskTests(TaskTestBase):
-    def test_load_streams_sources_and_returns_errors(self):
+    def test_load_streams_gzip_sources_and_returns_errors(self):
         sources = os.path.join(self.tmp, "sources")
         os.makedirs(sources)
-        write_source(os.path.join(sources, "a.json"), "Alpha", "magnet:a")
-        write_source(os.path.join(sources, "b.json"), "Beta", "magnet:b")
+        write_source(os.path.join(sources, "a.json.gz"), "Alpha", "magnet:a")
+        write_source(os.path.join(sources, "b.json.gz"), "Beta", "magnet:b")
         events = []
         (errors,) = hydra_tasks.load_sources(
             sources, lambda event, payload: events.append((event, payload))
@@ -53,13 +51,15 @@ class LoadTaskTests(TaskTestBase):
         source_events = [payload for event, payload in events if event == "source"]
         self.assertEqual([payload["index"] for payload in statuses], [1, 2])
         self.assertEqual([payload["total"] for payload in statuses], [2, 2])
-        self.assertEqual([payload[0] for payload in source_events], ["a.json", "b.json"])
+        self.assertEqual(
+            [payload[0] for payload in source_events], ["a.json.gz", "b.json.gz"]
+        )
         self.assertEqual([len(payload[1]) for payload in source_events], [1, 1])
 
     def test_load_reports_broken_source_and_continues(self):
         sources = os.path.join(self.tmp, "sources")
         os.makedirs(sources)
-        write_source(os.path.join(sources, "a.json"), "Alpha", "magnet:a")
+        write_source(os.path.join(sources, "a.json.gz"), "Alpha", "magnet:a")
         with open(os.path.join(sources, "bad.json"), "w", encoding="utf-8") as handle:
             handle.write("{not json")
         events = []
@@ -69,8 +69,7 @@ class LoadTaskTests(TaskTestBase):
         self.assertEqual(len(errors), 1)
         self.assertIn("bad.json", errors[0])
         source_events = [payload for event, payload in events if event == "source"]
-        self.assertEqual([payload[0] for payload in source_events], ["a.json"])
-
+        self.assertEqual([payload[0] for payload in source_events], ["a.json.gz"])
 
 class SearchTaskTests(unittest.TestCase):
     def test_search_returns_groups(self):

@@ -23,14 +23,19 @@ def payload(title="Alpha", uri="magnet:a"):
 
 def write_source(path, title="Old", uri="magnet:old"):
     data = payload(title, uri)
+    hydra_core.write_source_file(path, data)
+    return data
+
+
+def write_plain(path, title="Old", uri="magnet:old"):
+    data = payload(title, uri)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
     return data
 
 
 def read_source(path):
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
+    return hydra_core.read_source_file(path)
 
 
 class FakeDownloader:
@@ -38,7 +43,7 @@ class FakeDownloader:
         self.payloads = payloads or {}
         self.fail_urls = set(fail_urls)
 
-    def download_json(self, method, url, timeout=30):
+    def download_json(self, url, timeout=30):
         if url in self.fail_urls:
             raise RuntimeError("boom")
         return self.payloads[url]
@@ -46,7 +51,7 @@ class FakeDownloader:
 
 class CommandTestBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="hydra_command_test_")
+        self.tmp = tempfile.mkdtemp(prefix="gamemagnet_command_test_")
         self.sources = os.path.join(self.tmp, "sources")
         os.makedirs(self.sources)
 
@@ -66,15 +71,16 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(
             url_to_filename("https://example.com/sources/catalog.json"), "catalog"
         )
-        self.assertEqual(safe_source_filename(" My:Game "), "My_Game.json")
-        self.assertEqual(safe_source_filename("already.json"), "already.json")
+        self.assertEqual(safe_source_filename(" My:Game "), "My_Game.json.gz")
+        self.assertEqual(safe_source_filename("already.json"), "already.json.gz")
+        self.assertEqual(safe_source_filename("already.json.gz"), "already.json.gz")
 
 
 class FetchTests(CommandTestBase):
     def test_fetch_returns_validated_source(self):
         url = "https://example.com/a.json"
         commands = self.commands({url: json.dumps(payload())})
-        fetched = commands.fetch("urllib", url)
+        fetched = commands.fetch(url)
         self.assertEqual(fetched.url, url)
         self.assertEqual(fetched.count, 1)
         self.assertEqual(fetched.default_name, "a")
@@ -86,114 +92,127 @@ class FetchTests(CommandTestBase):
             {url: "{not json", "https://example.com/b.json": '{"foo": []}'}
         )
         with self.assertRaises(SourceCommandError):
-            commands.fetch("urllib", url)
+            commands.fetch(url)
         with self.assertRaises(SourceCommandError) as ctx:
-            commands.fetch("urllib", "https://example.com/b.json")
+            commands.fetch("https://example.com/b.json")
         self.assertIn("目录 JSON", str(ctx.exception))
 
 
 class AddTests(CommandTestBase):
-    def test_add_writes_json_url_and_clears_cache(self):
+    def test_add_writes_gzip_url_and_no_cache(self):
         url = "https://example.com/a.json"
         commands = self.commands({url: json.dumps(payload())})
-        cache = os.path.join(self.sources, ".cache", "a.json.cache")
-        os.makedirs(os.path.dirname(cache))
-        with open(cache, "w", encoding="utf-8") as handle:
-            handle.write("stale")
 
-        change = commands.add_fetched(commands.fetch("urllib", url), "a")
+        change = commands.add_fetched(commands.fetch(url), "a")
 
-        self.assertEqual(change.name, "a.json")
+        self.assertEqual(change.name, "a.json.gz")
         self.assertEqual(change.count, 1)
-        self.assertEqual(read_source(self.path("a.json"))["downloads"][0]["title"], "Alpha")
-        with open(self.path("a.json.url"), encoding="utf-8") as handle:
+        self.assertEqual(
+            read_source(self.path("a.json.gz"))["downloads"][0]["title"], "Alpha"
+        )
+        with open(self.path("a.json.gz.source-url"), encoding="utf-8") as handle:
             self.assertEqual(handle.read(), url)
-        self.assertFalse(os.path.exists(cache))
+        self.assertFalse(os.path.exists(os.path.join(self.sources, ".cache")))
 
     def test_add_refuses_existing_unless_overwritten(self):
         url = "https://example.com/a.json"
         commands = self.commands({url: json.dumps(payload("New"))})
-        write_source(self.path("a.json"), "Old")
-        fetched = commands.fetch("urllib", url)
+        write_source(self.path("a.json.gz"), "Old")
+        fetched = commands.fetch(url)
 
         with self.assertRaises(SourceExists):
             commands.add_fetched(fetched, "a.json")
-        self.assertEqual(read_source(self.path("a.json"))["downloads"][0]["title"], "Old")
+        self.assertEqual(
+            read_source(self.path("a.json.gz"))["downloads"][0]["title"], "Old"
+        )
 
         change = commands.add_fetched(fetched, "a.json", overwrite=True)
-        self.assertEqual(change.name, "a.json")
-        self.assertEqual(read_source(self.path("a.json"))["downloads"][0]["title"], "New")
+        self.assertEqual(change.name, "a.json.gz")
+        self.assertEqual(
+            read_source(self.path("a.json.gz"))["downloads"][0]["title"], "New"
+        )
 
 
 class UpdateTests(CommandTestBase):
-    def test_update_reads_url_sidecar_and_writes(self):
-        path = self.path("a.json")
+    def test_update_reads_url_sidecar_and_writes_gzip(self):
+        path = self.path("a.json.gz")
         write_source(path, "Old")
         hydra_core.write_url_file(path, "https://example.com/a.json")
         commands = self.commands(
             {"https://example.com/a.json": json.dumps(payload("New"))}
         )
 
-        change = commands.update("urllib", "a.json")
+        change = commands.update("a.json.gz")
 
-        self.assertEqual((change.name, change.count), ("a.json", 1))
+        self.assertEqual((change.name, change.count), ("a.json.gz", 1))
         self.assertEqual(read_source(path)["downloads"][0]["title"], "New")
+        self.assertFalse(os.path.exists(os.path.join(self.sources, ".cache")))
 
     def test_update_uses_explicit_url_and_updates_sidecar(self):
-        path = self.path("a.json")
+        path = self.path("a.json.gz")
         write_source(path, "Old")
         hydra_core.write_url_file(path, "https://example.com/old.json")
         commands = self.commands(
             {"https://example.com/new.json": json.dumps(payload("New"))}
         )
 
-        commands.update("urllib", "a.json", "https://example.com/new.json")
+        commands.update("a.json.gz", "https://example.com/new.json")
 
-        with open(path + ".url", encoding="utf-8") as handle:
+        with open(path + ".source-url", encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "https://example.com/new.json")
 
     def test_update_failure_includes_filename(self):
-        path = self.path("a.json")
+        path = self.path("a.json.gz")
         write_source(path, "Old")
         hydra_core.write_url_file(path, "https://example.com/bad.json")
         commands = self.commands({}, {"https://example.com/bad.json"})
 
         with self.assertRaises(SourceCommandError) as ctx:
-            commands.update("urllib", "a.json")
-        self.assertIn("a.json", str(ctx.exception))
+            commands.update("a.json.gz")
+        self.assertIn("a.json.gz", str(ctx.exception))
 
 
 class ImportTests(CommandTestBase):
-    def test_import_validates_files_without_url_sidecar(self):
+    def test_import_validates_files_and_writes_gzip(self):
         valid = os.path.join(self.tmp, "catalog-import.json")
-        write_source(valid, "Imported")
+        write_plain(valid, "Imported")
         invalid = os.path.join(self.tmp, "bad.json")
         with open(invalid, "w", encoding="utf-8") as handle:
             handle.write("{not json")
         not_json = os.path.join(self.tmp, "note.txt")
         with open(not_json, "w", encoding="utf-8") as handle:
             handle.write("x")
-        cache = os.path.join(self.sources, ".cache", "catalog-import.json.cache")
-        os.makedirs(os.path.dirname(cache))
-        with open(cache, "w", encoding="utf-8") as handle:
-            handle.write("stale")
 
         result = self.commands().import_files([valid, invalid, not_json])
 
-        self.assertEqual([change.name for change in result.added], ["catalog-import.json"])
+        self.assertEqual(
+            [change.name for change in result.added], ["catalog-import.json.gz"]
+        )
         self.assertEqual(len(result.errors), 2)
         self.assertEqual(
-            read_source(self.path("catalog-import.json"))["downloads"][0]["title"],
+            read_source(self.path("catalog-import.json.gz"))["downloads"][0]["title"],
             "Imported",
         )
-        self.assertFalse(os.path.exists(self.path("catalog-import.json.url")))
-        self.assertFalse(os.path.exists(cache))
+        self.assertFalse(os.path.exists(self.path("catalog-import.json.gz.source-url")))
+        self.assertFalse(os.path.exists(os.path.join(self.sources, ".cache")))
+
+    def test_import_accepts_gzip_input(self):
+        incoming = os.path.join(self.tmp, "packed.json.gz")
+        write_source(incoming, "Packed")
+
+        result = self.commands().import_files([incoming])
+
+        self.assertEqual([change.name for change in result.added], ["packed.json.gz"])
+        self.assertEqual(
+            read_source(self.path("packed.json.gz"))["downloads"][0]["title"],
+            "Packed",
+        )
 
     def test_import_requires_approved_overwrite(self):
-        dest = self.path("dup.json")
+        dest = self.path("dup.json.gz")
         write_source(dest, "Old")
         incoming = os.path.join(self.tmp, "dup.json")
-        write_source(incoming, "New")
+        write_plain(incoming, "New")
         commands = self.commands()
 
         result = commands.import_files([incoming])
@@ -201,38 +220,36 @@ class ImportTests(CommandTestBase):
         self.assertEqual(len(result.errors), 1)
         self.assertEqual(read_source(dest)["downloads"][0]["title"], "Old")
 
-        result = commands.import_files([incoming], overwrite=("dup.json",))
-        self.assertEqual([change.name for change in result.added], ["dup.json"])
+        result = commands.import_files([incoming], overwrite=("dup.json.gz",))
+        self.assertEqual([change.name for change in result.added], ["dup.json.gz"])
         self.assertEqual(read_source(dest)["downloads"][0]["title"], "New")
 
 
 class DeleteTests(CommandTestBase):
-    def test_delete_removes_source_url_and_caches(self):
-        path = self.path("a.json")
+    def test_delete_removes_sidecars_for_gzip_and_legacy_plain(self):
+        path = self.path("a.json.gz")
         write_source(path)
         hydra_core.write_url_file(path, "https://example.com/a.json")
-        cache = os.path.join(self.sources, ".cache", "a.json.cache")
-        os.makedirs(os.path.dirname(cache))
-        for target in (cache, cache + ".tmp"):
-            with open(target, "w", encoding="utf-8") as handle:
-                handle.write("x")
+        legacy = self.path("a.json")
+        write_plain(legacy)
+        hydra_core.write_url_file(legacy, "https://example.com/legacy.json")
 
-        change = self.commands().delete("a.json")
+        change = self.commands().delete("a.json.gz")
 
-        self.assertEqual(change.name, "a.json")
-        for target in (path, path + ".url", cache, cache + ".tmp"):
+        self.assertEqual(change.name, "a.json.gz")
+        for target in (path, path + ".source-url", legacy, legacy + ".source-url"):
             self.assertFalse(os.path.exists(target))
 
     def test_delete_rejects_paths_outside_sources(self):
         with self.assertRaises(SourceCommandError):
-            self.commands().delete(os.path.join("..", "a.json"))
+            self.commands().delete(os.path.join("..", "a.json.gz"))
 
 
 class RefreshTests(CommandTestBase):
     def test_refresh_reports_progress_and_failures(self):
-        good = self.path("a.json")
-        bad = self.path("b.json")
-        no_url = self.path("c.json")
+        good = self.path("a.json.gz")
+        bad = self.path("b.json.gz")
+        no_url = self.path("c.json.gz")
         for target in (good, bad, no_url):
             write_source(target, "Old")
         hydra_core.write_url_file(good, "https://example.com/a.json")
@@ -244,18 +261,20 @@ class RefreshTests(CommandTestBase):
         events = []
 
         result = commands.refresh(
-            "urllib", report=lambda index, total, name: events.append((index, total, name))
+            report=lambda index, total, name: events.append((index, total, name))
         )
 
-        self.assertEqual([change.name for change in result.updated], ["a.json"])
-        self.assertEqual(result.failed, (("b.json", "boom"),))
-        self.assertEqual(events, [(1, 2, "a.json"), (2, 2, "b.json")])
+        self.assertEqual([change.name for change in result.updated], ["a.json.gz"])
+        self.assertEqual(result.failed, (("b.json.gz", "boom"),))
+        self.assertEqual(
+            events, [(1, 2, "a.json.gz"), (2, 2, "b.json.gz")]
+        )
         self.assertEqual(read_source(good)["downloads"][0]["title"], "New")
         self.assertEqual(read_source(bad)["downloads"][0]["title"], "Old")
 
     def test_refresh_accepts_name_subset(self):
-        first = self.path("a.json")
-        second = self.path("b.json")
+        first = self.path("a.json.gz")
+        second = self.path("b.json.gz")
         write_source(first)
         write_source(second)
         hydra_core.write_url_file(first, "https://example.com/a.json")
@@ -264,9 +283,9 @@ class RefreshTests(CommandTestBase):
             {"https://example.com/a.json": json.dumps(payload("New"))}
         )
 
-        result = commands.refresh("urllib", names=["a.json"])
+        result = commands.refresh(names=["a.json.gz"])
 
-        self.assertEqual([change.name for change in result.updated], ["a.json"])
+        self.assertEqual([change.name for change in result.updated], ["a.json.gz"])
         self.assertEqual(read_source(second)["downloads"][0]["title"], "Old")
 
 

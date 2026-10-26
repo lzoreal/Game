@@ -56,10 +56,13 @@ def url_to_filename(url):
 
 def safe_source_filename(text):
     name = str(text or "").strip()
-    if name.lower().endswith(".json"):
+    lower = name.lower()
+    if lower.endswith(".json.gz"):
+        name = name[:-8]
+    elif lower.endswith(".json"):
         name = name[:-5]
     name = re.sub(r'[\\/:*?"<>|]', '_', name).strip()
-    return (name[:80] or "source") + ".json"
+    return (name[:80] or "source") + ".json.gz"
 
 
 def _validate_data(data, name):
@@ -71,11 +74,10 @@ def _validate_data(data, name):
 
 
 def _read_source_file(path, name):
-    with open(path, "r", encoding="utf-8") as handle:
-        try:
-            data = json.load(handle)
-        except json.JSONDecodeError as exc:
-            raise SourceCommandError(f"不是有效 JSON: {exc}") from exc
+    try:
+        data = core.read_source_file(path)
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise SourceCommandError(f"不是有效 JSON: {exc}") from exc
     return _validate_data(data, name)
 
 
@@ -92,9 +94,9 @@ class SourceCommands:
         self.sources_dir = sources_dir
         self._downloader_factory = downloader_factory or core.Downloader
 
-    def fetch(self, method, url):
+    def fetch(self, url):
         downloader = self._downloader_factory()
-        content = downloader.download_json(method, url)
+        content = downloader.download_json(url)
         default_name = url_to_filename(url)
         data, count = _parse_content(content, default_name)
         return FetchedSource(
@@ -112,14 +114,14 @@ class SourceCommands:
         self._write(name, fetched.url, fetched.data)
         return SourceChange(name, fetched.count)
 
-    def update(self, method, name, url=None):
+    def update(self, name, url=None):
         name = self._checked_name(name)
         path = os.path.join(self.sources_dir, name)
         url = (url or "").strip() or core.read_source_url(path)
         if not url:
             raise SourceCommandError(f"{name}: 没有记录源地址")
         try:
-            fetched = self.fetch(method, url)
+            fetched = self.fetch(url)
         except Exception as exc:
             raise SourceCommandError(f"{name}: {exc}") from exc
         self._write(name, url, fetched.data)
@@ -131,8 +133,8 @@ class SourceCommands:
         errors = []
         for path in paths:
             base = os.path.basename(str(path))
-            if not base.lower().endswith(".json"):
-                errors.append(f"{base}: 不是 .json 文件")
+            if not base.lower().endswith((".json", ".json.gz")):
+                errors.append(f"{base}: 不是 .json 或 .json.gz 文件")
                 continue
             name = safe_source_filename(base)
             try:
@@ -145,8 +147,7 @@ class SourceCommands:
                 errors.append(f"{name}: 已存在，未覆盖")
                 continue
             try:
-                core.write_json_atomic(dest, data)
-                core.invalidate_cache(self.sources_dir, name)
+                core.write_source_file(dest, data)
             except OSError as exc:
                 errors.append(f"{name}: {exc}")
                 continue
@@ -156,22 +157,22 @@ class SourceCommands:
     def delete(self, name):
         name = self._checked_name(name)
         path = os.path.join(self.sources_dir, name)
-        cache_path = core.cache_path_for(self.sources_dir, name)
-        for target in (path, path + ".url", cache_path, cache_path + ".tmp"):
+        targets = {path, path + core.SOURCE_URL_SUFFIX}
+        if name.lower().endswith(".json.gz"):
+            legacy = path[:-3]
+        else:
+            legacy = path + ".gz"
+        targets.update((legacy, legacy + core.SOURCE_URL_SUFFIX))
+        for target in targets:
             try:
                 os.remove(target)
             except OSError:
                 pass
         return SourceChange(name)
 
-    def refresh(self, method, names=None, report=None):
+    def refresh(self, names=None, report=None):
         if names is None:
-            try:
-                names = sorted(
-                    n for n in os.listdir(self.sources_dir) if n.endswith(".json")
-                )
-            except OSError:
-                names = []
+            names = core.source_filenames(self.sources_dir)
         targets = []
         for name in names:
             name = self._checked_name(name)
@@ -187,7 +188,7 @@ class SourceCommands:
             if report:
                 report(index, total, name)
             try:
-                content = downloader.download_json(method, url)
+                content = downloader.download_json(url)
                 data, count = _parse_content(content, name)
                 self._write(name, url, data)
                 updated.append(SourceChange(name, count))
@@ -198,17 +199,16 @@ class SourceCommands:
     def _write(self, name, url, data):
         path = os.path.join(self.sources_dir, name)
         try:
-            core.write_json_atomic(path, data)
+            core.write_source_file(path, data)
             core.write_url_file(path, url)
         except OSError as exc:
             raise SourceCommandError(f"{name}: {exc}") from exc
-        core.invalidate_cache(self.sources_dir, name)
         return path
 
     @staticmethod
     def _checked_name(name):
         raw = str(name or "")
         base = os.path.basename(raw)
-        if raw != base or not base.lower().endswith(".json"):
+        if raw != base or not base.lower().endswith((".json", ".json.gz")):
             raise SourceCommandError(f"无效的源文件名: {raw!r}")
         return base

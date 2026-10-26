@@ -26,12 +26,7 @@ class SearchController:
         self.debounce_ms = debounce_ms
         self.token = 0
         self.query = ""
-        self.sort_active = False
         self.sort_desc = True
-
-    def invalidate(self):
-        self.token += 1
-        return self.token
 
     def observe(self, text):
         self.query = str(text or "").strip()
@@ -60,14 +55,8 @@ class SearchController:
         return (end - ticket.started) * 1000
 
     def toggle_date_sort(self):
-        if self.sort_active:
-            self.sort_desc = not self.sort_desc
-        else:
-            self.sort_active = True
-            self.sort_desc = True
+        self.sort_desc = not self.sort_desc
         return self.sort_desc
 
     def apply_sort(self, groups):
-        if not self.sort_active:
-            return list(groups)
         return sort_by_date(groups, self.sort_desc)

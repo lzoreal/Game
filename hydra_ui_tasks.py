@@ -63,7 +63,7 @@ class TaskRunner(QObject):
         return self._active.get(kind, 0)
 
     def busy(self):
-        return any(kind != "search" for kind in self._active)
+        return any(kind not in ("search", "swarm", "check_update") for kind in self._active)
 
     def shutdown(self):
         for thread in list(self._threads):

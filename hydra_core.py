@@ -1,31 +1,26 @@
-"""Core logic for the local game catalog manager: parsing, caching, search.
+"""Core logic for the local game catalog manager: gzip storage, parsing, search.
 
 No GUI imports, so it can be shared by the PySide6 UI and Qt worker threads.
 """
 
+import gzip
 import html
 import json
 import os
 import re
 import ssl
-import subprocess
 import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime
 from difflib import SequenceMatcher
+from urllib.parse import urlparse
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
-try:
-    import cloudscraper
-    CLOUDSCRAPER_AVAILABLE = True
-except ImportError:
-    CLOUDSCRAPER_AVAILABLE = False
-
-APP_VERSION = "v4.0"
-CACHE_VERSION = 3
+APP_VERSION = "v1.0"
 MAX_RESULTS = 1000
+SOURCE_URL_SUFFIX = ".source-url"
 
 DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -84,7 +79,13 @@ def dedup_key(title):
 
 
 def display_name(filename):
-    stem = filename[:-5] if filename.lower().endswith(".json") else filename
+    lower = filename.lower()
+    if lower.endswith(".json.gz"):
+        stem = filename[:-8]
+    elif lower.endswith(".json"):
+        stem = filename[:-5]
+    else:
+        stem = filename
     stem = stem.lower()
     for suffix in ("_cleaned", "-cleaned", "_source", "-source", "source", "-games", "_games"):
         if stem.endswith(suffix):
@@ -249,87 +250,59 @@ def finalize_group(group):
 
 def read_source_url(path):
     try:
-        with open(path + ".url", "r", encoding="utf-8") as f:
+        with open(path + SOURCE_URL_SUFFIX, "r", encoding="utf-8") as f:
             return f.read().strip() or None
     except OSError:
         return None
 
 
 def write_url_file(path, url):
-    with open(path + ".url", "w", encoding="utf-8") as f:
+    with open(path + SOURCE_URL_SUFFIX, "w", encoding="utf-8") as f:
         f.write(url)
 
 
-def cache_path_for(sources_dir, name):
-    return os.path.join(sources_dir, ".cache", name + ".cache")
-
-
-def invalidate_cache(sources_dir, name):
-    cache_path = cache_path_for(sources_dir, name)
-    for path in (cache_path, cache_path + ".tmp"):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-def write_json_atomic(path, data, indent=2):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=indent)
-    os.replace(tmp, path)
-
-
-def write_cache_file(cache_path, signature, detected_key, invalid_count, items):
+def source_filenames(sources_dir):
     try:
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        tmp = cache_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "version": CACHE_VERSION,
-                "signature": signature,
-                "detected_key": detected_key,
-                "invalid_count": invalid_count,
-                "items": items,
-            }, f, ensure_ascii=False)
-        os.replace(tmp, cache_path)
+        names = os.listdir(sources_dir)
     except OSError:
-        pass
+        return []
+    plain = {name for name in names if name.lower().endswith(".json")}
+    packed = {name for name in names if name.lower().endswith(".json.gz")}
+    shadowed = {name[:-3] for name in packed}
+    return sorted(
+        name
+        for name in names
+        if name in packed or (name in plain and name not in shadowed)
+    )
+
+
+def read_source_file(path):
+    if path.lower().endswith(".gz"):
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            return json.load(handle)
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_source_file(path, data):
+    payload = json.dumps(
+        data, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    if path.lower().endswith(".gz"):
+        payload = gzip.compress(payload, compresslevel=6, mtime=0)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as handle:
+        handle.write(payload)
+    os.replace(tmp, path)
 
 
 def load_source(sources_dir, name):
     path = os.path.join(sources_dir, name)
     stat = os.stat(path)
-    signature = [stat.st_mtime, stat.st_size]
-    cache_path = cache_path_for(sources_dir, name)
     url = read_source_url(path)
     display = display_name(name)
 
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-            if cache.get("version") == CACHE_VERSION and cache.get("signature") == signature:
-                items = cache["items"]
-                for item in items:
-                    item.setdefault("nt", normalize_text(item.get("title")))
-                    item.setdefault("dkey", dedup_key(item.get("title")))
-                    item["source_name"] = name
-                    item["source_display"] = display
-                return items, {
-                    "display": display,
-                    "count": len(items),
-                    "url": url,
-                    "path": path,
-                    "updated": stat.st_mtime,
-                    "detected_key": cache.get("detected_key"),
-                    "invalid_count": cache.get("invalid_count", 0),
-                }
-        except (OSError, ValueError, KeyError):
-            pass
-
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = read_source_file(path)
 
     raw_items, detected_key = extract_repacks(data, name)
     if not raw_items:
@@ -361,8 +334,6 @@ def load_source(sources_dir, name):
         if isinstance(fallback, str):
             url = fallback.strip() or None
 
-    write_cache_file(cache_path, signature, detected_key, invalid, items)
-
     return items, {
         "display": display,
         "count": len(items),
@@ -380,10 +351,7 @@ def stream_sources(sources_dir, progress=None, on_source=None):
     Returns the list of per-source error messages. The caller owns accumulation;
     this function never keeps the items it has already delivered.
     """
-    try:
-        names = sorted(n for n in os.listdir(sources_dir) if n.endswith(".json"))
-    except OSError:
-        names = []
+    names = source_filenames(sources_dir)
 
     errors = []
     total = len(names)
@@ -465,88 +433,24 @@ def search_items(items, query, fuzzy, min_similarity, source_filter, limit=MAX_R
 
 
 class Downloader:
-    """Sequential downloader with cloudscraper -> curl -> urllib fallback."""
-
-    def __init__(self):
-        self.scraper = None
-
-    def download_json(self, method, url, timeout=30):
-        if method == "manual":
-            raise ValueError("当前为手动导入模式，无法自动下载。")
-
-        errors = []
-
-        if method == "cloudscraper":
-            if not CLOUDSCRAPER_AVAILABLE:
-                errors.append("cloudscraper 未安装")
-            else:
-                try:
-                    if self.scraper is None:
-                        self.scraper = cloudscraper.create_scraper()
-                    resp = self.scraper.get(
-                        url, timeout=timeout, headers={'Accept': 'application/json'}
-                    )
-                    resp.raise_for_status()
-                    return resp.text
-                except Exception as exc:
-                    errors.append(f"cloudscraper: {exc}")
-
-        if method in ("curl", "cloudscraper"):
-            try:
-                if subprocess.run(["curl", "--version"], capture_output=True).returncode == 0:
-                    content = self._download_with_curl(url, timeout)
-                    json.loads(content)
-                    return content
-                errors.append("系统未安装 curl")
-            except Exception as exc:
-                errors.append(f"curl: {exc}")
-
-        if method in ("urllib", "curl", "cloudscraper"):
-            try:
-                return self._download_with_urllib(url, timeout)
-            except urllib.error.HTTPError as exc:
-                if exc.code == 403:
-                    errors.append(
-                        "urllib: 403 Forbidden - Cloudflare 拦截了自动下载。\n"
-                        "可改用 cloudscraper，或手动在浏览器下载 JSON 后导入，或使用备用镜像源。"
-                    )
-                else:
-                    errors.append(f"urllib: {exc}")
-            except Exception as exc:
-                errors.append(f"urllib: {exc}")
-
-        raise RuntimeError("下载失败:\n" + "\n".join(errors or ["未知下载方式"]))
-
-    def _download_with_curl(self, url, timeout=30):
-        cmd = [
-            'curl', '-s', '-L', '--max-time', str(timeout),
-            '-H', f'User-Agent: {DEFAULT_HEADERS["User-Agent"]}',
-            '-H', 'Accept: application/json,text/plain,*/*',
-            '-H', 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',
-            '-H', 'Connection: keep-alive',
-            '--compressed',
-            url,
-        ]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore'
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"curl 失败: {result.stderr}")
-        return result.stdout
-
-    def _download_with_urllib(self, url, timeout=30):
+    def download_json(self, url, timeout=30):
         headers = DEFAULT_HEADERS.copy()
-        headers['Accept-Encoding'] = 'gzip'
-        from urllib.parse import urlparse
+        headers["Accept-Encoding"] = "gzip"
         parsed = urlparse(url)
-        headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
+        headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
 
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            import gzip
-            content = response.read()
-            if response.info().get('Content-Encoding') == 'gzip':
-                content = gzip.decompress(content)
-            return content.decode('utf-8')
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                content = response.read()
+                if response.info().get("Content-Encoding") == "gzip":
+                    content = gzip.decompress(content)
+                return content.decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"下载失败: HTTP {exc.code} {exc.reason}") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise RuntimeError(f"下载失败: {exc}") from exc
+        except ValueError as exc:
+            raise RuntimeError(f"下载失败: 响应内容无效: {exc}") from exc
 
 

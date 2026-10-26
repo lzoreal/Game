@@ -10,3 +10,8 @@ sources/
 venv/
 .idea/
 .vscode/
+
+# PyInstaller output
+build/
+dist/
+/GameMagNet.exe
