@@ -2,6 +2,8 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::mpsc;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -289,6 +291,19 @@ impl SourceCommands {
         names: Option<&[String]>,
         report: &mut dyn FnMut(usize, usize, &str),
     ) -> RefreshResult {
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 4);
+        self.refresh_with_workers(names, report, workers)
+    }
+
+    fn refresh_with_workers(
+        &self,
+        names: Option<&[String]>,
+        report: &mut dyn FnMut(usize, usize, &str),
+        max_workers: usize,
+    ) -> RefreshResult {
         let names = names
             .map(|list| list.to_vec())
             .unwrap_or_else(|| storage::source_filenames(&self.sources_dir));
@@ -304,18 +319,61 @@ impl SourceCommands {
         }
 
         let total = targets.len();
+        if total == 0 {
+            return RefreshResult::default();
+        }
+
+        let workers = max_workers.clamp(1, 4).min(total);
+        let next = AtomicUsize::new(0);
+        let (sender, receiver) = mpsc::channel::<(
+            usize,
+            &str,
+            Result<SourceChange, (String, String)>,
+        )>();
+        let mut slots: Vec<Option<Result<SourceChange, (String, String)>>> =
+            (0..total).map(|_| None).collect();
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let sender = sender.clone();
+                let targets = &targets;
+                let next = &next;
+                scope.spawn(move || loop {
+                    let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                    if index >= targets.len() {
+                        break;
+                    }
+                    let (name, url) = &targets[index];
+                    let outcome = match self.fetch(url) {
+                        Ok(fetched) => match self.write(name, url, &fetched.data) {
+                            Ok(()) => Ok(SourceChange {
+                                name: name.clone(),
+                                count: Some(fetched.count),
+                            }),
+                            Err(error) => Err((name.clone(), error.to_string())),
+                        },
+                        Err(error) => Err((name.clone(), error.to_string())),
+                    };
+                    if sender.send((index, name.as_str(), outcome)).is_err() {
+                        break;
+                    }
+                });
+            }
+            drop(sender);
+
+            let mut completed = 0usize;
+            for (index, name, outcome) in receiver {
+                completed += 1;
+                report(completed, total, name);
+                slots[index] = Some(outcome);
+            }
+        });
+
         let mut result = RefreshResult::default();
-        for (index, (name, url)) in targets.into_iter().enumerate() {
-            report(index + 1, total, &name);
-            match self.fetch(&url) {
-                Ok(fetched) => match self.write(&name, &url, &fetched.data) {
-                    Ok(()) => result.updated.push(SourceChange {
-                        name,
-                        count: Some(fetched.count),
-                    }),
-                    Err(error) => result.failed.push((name, error.to_string())),
-                },
-                Err(error) => result.failed.push((name, error.to_string())),
+        for slot in slots.into_iter().flatten() {
+            match slot {
+                Ok(change) => result.updated.push(change),
+                Err((name, error)) => result.failed.push((name, error)),
             }
         }
         result
@@ -358,10 +416,18 @@ mod tests {
 
     struct FakeClient {
         responses: Mutex<HashMap<String, Result<String, String>>>,
+        delay: Duration,
     }
 
     impl FakeClient {
         fn new(entries: Vec<(&str, Result<String, String>)>) -> Arc<Self> {
+            Self::with_delay(entries, Duration::ZERO)
+        }
+
+        fn with_delay(
+            entries: Vec<(&str, Result<String, String>)>,
+            delay: Duration,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(
                     entries
@@ -369,6 +435,7 @@ mod tests {
                         .map(|(url, result)| (url.to_string(), result))
                         .collect(),
                 ),
+                delay,
             })
         }
     }
@@ -381,6 +448,9 @@ mod tests {
             _timeout: Duration,
             _profile: Option<&str>,
         ) -> Result<HttpResponse, String> {
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
             match self.responses.lock().unwrap().get(url) {
                 Some(Ok(body)) => Ok(HttpResponse {
                     status: 200,
@@ -606,9 +676,53 @@ mod tests {
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].0, "b.json.gz");
         assert!(result.failed[0].1.contains("boom"));
-        assert_eq!(
-            events,
-            vec![(1, 2, "a.json.gz".to_string()), (2, 2, "b.json.gz".to_string())]
+        assert_eq!(events.len(), 2);
+        let mut names: Vec<&str> = events.iter().map(|event| event.2.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a.json.gz", "b.json.gz"]);
+        let mut indices: Vec<usize> = events.iter().map(|event| event.0).collect();
+        indices.sort();
+        assert_eq!(indices, vec![1, 2]);
+        assert!(events.iter().all(|event| event.1 == 2));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refresh_runs_sources_in_parallel_and_keeps_order() {
+        let dir = temp_dir("refresh-parallel");
+        let stale = serde_json::json!({"downloads": [{"title": "Old", "uris": ["magnet:old"]}]});
+        let urls = [
+            "https://example.com/a.json",
+            "https://example.com/b.json",
+            "https://example.com/c.json",
+        ];
+        for (index, url) in urls.iter().enumerate() {
+            let path = dir.join(format!("{index}.json.gz"));
+            storage::write_source_file(&path, &stale).unwrap();
+            storage::write_url_file(&path, url).unwrap();
+        }
+        let client = FakeClient::with_delay(
+            urls.iter()
+                .map(|url| (*url, Ok(payload("New"))))
+                .collect(),
+            Duration::from_millis(300),
+        );
+        let commands = SourceCommands::new(dir.clone(), Arc::new(Downloader::new(client)));
+
+        let started = std::time::Instant::now();
+        let result = commands.refresh_with_workers(None, &mut |_, _, _| {}, 3);
+        let elapsed = started.elapsed();
+
+        let names: Vec<&str> = result
+            .updated
+            .iter()
+            .map(|change| change.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["0.json.gz", "1.json.gz", "2.json.gz"]);
+        assert!(result.failed.is_empty());
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "parallel refresh took {elapsed:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

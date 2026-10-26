@@ -19,6 +19,7 @@ impl ReqwestClient {
     pub fn new() -> Result<Self, String> {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
+            .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
             .map_err(|error| error.to_string())?;

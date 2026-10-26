@@ -24,6 +24,24 @@ use crate::net_reqwest::ReqwestClient;
 use crate::platform::SystemPlatform;
 use crate::state::{AppState, Emitter};
 
+fn cleanup_update_leftovers() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(name) = exe.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(dir) = exe.parent().map(|dir| dir.to_path_buf()) else {
+        return;
+    };
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let _ = std::fs::remove_file(dir.join(format!("{name}.old")));
+        let _ = std::fs::remove_file(dir.join(format!("{name}.new")));
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -52,6 +70,7 @@ pub fn run() {
                     let _ = window.center();
                 }
             }
+            cleanup_update_leftovers();
             state.start();
             Ok(())
         })
@@ -80,6 +99,7 @@ pub fn run() {
             ipc::pick_import_files,
             ipc::refresh_all,
             ipc::check_updates,
+            ipc::install_update,
             ipc::query_swarm,
             ipc::send_to_bt,
             ipc::refresh_bt_targets,

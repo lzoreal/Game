@@ -180,6 +180,11 @@ pub fn check_updates(state: State<'_, SharedState>) {
 }
 
 #[tauri::command]
+pub fn install_update(state: State<'_, SharedState>) {
+    shared(&state).install_update();
+}
+
+#[tauri::command]
 pub fn query_swarm(state: State<'_, SharedState>, uri: String) {
     shared(&state).query_swarm(&uri);
 }

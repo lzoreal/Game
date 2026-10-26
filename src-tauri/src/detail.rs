@@ -52,16 +52,12 @@ pub struct DetailModel {
 }
 
 pub fn card_key(item: &Item) -> String {
-    format!(
-        "{}|{}|{}",
-        if item.source_name.is_empty() {
-            &item.source_display
-        } else {
-            &item.source_name
-        },
-        if item.dkey.is_empty() { &item.nt } else { &item.dkey },
-        item.upload_date
-    )
+    let source = if item.source_name.is_empty() {
+        item.source_display.as_ref()
+    } else {
+        item.source_name.as_ref()
+    };
+    format!("{}|{}|{}", source, item.key_id, item.upload_date)
 }
 
 pub fn build_detail(
@@ -113,7 +109,7 @@ fn build_card(item: &Item, key: &str, expanded: bool, link_limit: usize) -> Deta
     let description = clean_html(&item.description_html);
     let date_text = match item.date_dt {
         Some(dt) => format_date(&dt),
-        None => item.upload_date.clone(),
+        None => item.upload_date.to_string(),
     };
 
     let magnets: Vec<DetailLink> = item
@@ -121,7 +117,7 @@ fn build_card(item: &Item, key: &str, expanded: bool, link_limit: usize) -> Deta
         .iter()
         .filter(|uri| uri.starts_with("magnet"))
         .map(|uri| DetailLink {
-            uri: uri.clone(),
+            uri: uri.to_string(),
             is_magnet: true,
         })
         .collect();
@@ -130,7 +126,7 @@ fn build_card(item: &Item, key: &str, expanded: bool, link_limit: usize) -> Deta
         .iter()
         .filter(|uri| uri.starts_with("http"))
         .map(|uri| DetailLink {
-            uri: uri.clone(),
+            uri: uri.to_string(),
             is_magnet: false,
         })
         .collect();
@@ -139,7 +135,7 @@ fn build_card(item: &Item, key: &str, expanded: bool, link_limit: usize) -> Deta
         .iter()
         .filter(|uri| !uri.starts_with("magnet") && !uri.starts_with("http"))
         .map(|uri| DetailLink {
-            uri: uri.clone(),
+            uri: uri.to_string(),
             is_magnet: false,
         })
         .collect();
@@ -170,9 +166,9 @@ fn build_card(item: &Item, key: &str, expanded: bool, link_limit: usize) -> Deta
 
     DetailCard {
         key: key.to_string(),
-        source: item.source_display.clone(),
+        source: item.source_display.to_string(),
         date: date_text,
-        size: item.file_size.clone(),
+        size: item.file_size.to_string(),
         description,
         links,
     }
@@ -184,22 +180,25 @@ mod tests {
     use crate::catalog::finalize_group;
     use crate::dates::parse_upload_date;
     use crate::model::Item;
-    use crate::text::{dedup_key, normalize_text};
+    use crate::text::normalize_text;
 
     fn item(uris: Vec<&str>, date: &str, description: &str) -> Item {
         let title = "Demo Game";
         Item {
-            title: title.to_string(),
-            nt: normalize_text(title),
-            dkey: dedup_key(title),
-            uris: uris.into_iter().map(str::to_string).collect(),
-            file_size: "10 GB".to_string(),
-            upload_date: date.to_string(),
+            title: title.to_string().into_boxed_str(),
+            nt: normalize_text(title).into_boxed_str(),
+            key_id: 1,
+            uris: uris
+                .into_iter()
+                .map(|uri| uri.to_string().into_boxed_str())
+                .collect(),
+            file_size: "10 GB".into(),
+            upload_date: date.into(),
             date_dt: parse_upload_date(Some(date)),
-            source_name: "src.json.gz".to_string(),
-            source_display: "src".to_string(),
+            source_name: std::sync::Arc::from("src.json.gz"),
+            source_display: std::sync::Arc::from("src"),
             source_index: 0,
-            description_html: description.to_string(),
+            description_html: description.to_string().into_boxed_str(),
         }
     }
 

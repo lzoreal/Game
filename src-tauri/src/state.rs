@@ -23,7 +23,7 @@ use crate::storage;
 use crate::swarm;
 use crate::update::{self, UpdateResult};
 
-pub const APP_VERSION: &str = "v1.2.0";
+pub const APP_VERSION: &str = "v1.3.0";
 const DEBOUNCE_MS: u64 = 250;
 const RAW_LIMIT: usize = 100_000;
 
@@ -98,7 +98,7 @@ impl Default for DetailPayload {
 struct Inner {
     items: Vec<Item>,
     metas: BTreeMap<String, SourceMeta>,
-    group_keys: HashSet<String>,
+    group_keys: HashSet<u64>,
     query: String,
     fuzzy: bool,
     threshold: f64,
@@ -210,6 +210,93 @@ fn normalize_source_urls(lines: &[String]) -> Vec<String> {
         }
     }
     urls
+}
+
+fn download_release_bytes(downloader: &Downloader, url: &str) -> Result<Vec<u8>, String> {
+    let headers = [
+        ("User-Agent", update::USER_AGENT),
+        ("Accept", "application/octet-stream"),
+    ];
+    let mut errors = Vec::new();
+    match downloader.download_bytes(url, &headers, Duration::from_secs(15)) {
+        Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
+        Ok(_) => errors.push("直连返回空文件".to_string()),
+        Err(error) => errors.push(format!("直连: {error}")),
+    }
+
+    if url.starts_with("https://github.com/") {
+        for mirror in ["https://gh-proxy.com/", "https://ghfast.top/"] {
+            let candidate = format!("{mirror}{url}");
+            match downloader.download_bytes(&candidate, &headers, Duration::from_secs(60)) {
+                Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
+                Ok(_) => errors.push(format!("{mirror} 返回空文件")),
+                Err(error) => errors.push(format!("{mirror}: {error}")),
+            }
+        }
+    }
+
+    Err(format!("下载更新失败。{}", errors.join("；")))
+}
+
+fn replace_running_executable(bytes: &[u8]) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|error| format!("无法定位当前程序：{error}"))?;
+    replace_executable_at(&exe, bytes)?;
+    Ok(exe)
+}
+
+fn replace_executable_at(exe: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "无法定位程序所在目录。".to_string())?;
+    let name = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "程序文件名无效。".to_string())?;
+    let new_path = dir.join(format!("{name}.new"));
+    let old_path = dir.join(format!("{name}.old"));
+
+    std::fs::write(&new_path, bytes).map_err(|error| {
+        format!("无法写入更新文件（程序目录不可写？请改用发布页中的安装包）：{error}")
+    })?;
+    if old_path.exists() {
+        let _ = std::fs::remove_file(&old_path);
+    }
+    std::fs::rename(exe, &old_path).map_err(|error| format!("无法备份当前程序：{error}"))?;
+    if let Err(error) = std::fs::rename(&new_path, exe) {
+        let _ = std::fs::rename(&old_path, exe);
+        let _ = std::fs::remove_file(&new_path);
+        return Err(format!("无法替换程序文件：{error}"));
+    }
+    Ok(())
+}
+
+fn spawn_restarted_exe(exe: &std::path::Path) -> Result<(), String> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "无法定位程序所在目录。".to_string())?;
+    let script = dir.join(format!("gamemagnet-restart-{}.cmd", std::process::id()));
+    let content = format!(
+        "@echo off\r\nping -n 3 127.0.0.1 >nul\r\nstart \"\" \"{}\"\r\ndel \"%~f0\"\r\n",
+        exe.display()
+    );
+    std::fs::write(&script, content)
+        .map_err(|error| format!("无法写入重启脚本：{error}"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .args(["/C", script.to_string_lossy().as_ref()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("无法启动更新后的程序：{error}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = script;
+        Err("当前平台不支持自动重启".to_string())
+    }
 }
 
 fn group_signature(group: &Group) -> String {
@@ -540,7 +627,7 @@ impl AppState {
     }
 
     fn add_source(&self, name: &str, items: Vec<Item>, meta: SourceMeta) {
-        let keys: Vec<String> = items.iter().map(|item| item.dkey.clone()).collect();
+        let keys: Vec<u64> = items.iter().map(|item| item.key_id).collect();
         let mut inner = self.lock();
         inner.items.extend(items);
         inner.group_keys.extend(keys);
@@ -941,7 +1028,7 @@ impl AppState {
             let entries: Vec<(String, usize)> = group
                 .items
                 .iter()
-                .map(|item| (item.source_name.clone(), item.source_index))
+                .map(|item| (item.source_name.to_string(), item.source_index))
                 .collect();
             let cached = inner
                 .detail_raw
@@ -1289,13 +1376,17 @@ impl AppState {
         let state = Arc::clone(self);
         let downloader = Arc::clone(&self.downloader);
         std::thread::spawn(move || {
+            let api_base = std::env::var("GAMEMAGNET_UPDATE_API")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| update::API_BASE.to_string());
             let outcome = update::check_latest(
                 &downloader,
                 "lzoreal/Game",
                 APP_VERSION,
                 None,
                 Duration::from_secs(6),
-                update::API_BASE,
+                &api_base,
             );
             state.on_checked_for_updates(outcome);
         });
@@ -1318,6 +1409,7 @@ impl AppState {
                     "name": result.release.name,
                     "url": result.release.url,
                     "downloadUrl": result.release.download_url,
+                    "digest": result.release.download_digest,
                     "notes": result.release.notes,
                     "published": result.release.published_at,
                 });
@@ -1329,6 +1421,97 @@ impl AppState {
                 self.emit("update-dialog", Value::Null);
             }
         }
+    }
+
+    pub fn install_update(self: &Arc<Self>) {
+        let (download_url, digest, release_url, latest) = {
+            let inner = self.lock();
+            let Some(info) = inner.update_info.as_ref() else {
+                return;
+            };
+            (
+                info.get("downloadUrl")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                info.get("digest").and_then(Value::as_str).map(str::to_string),
+                info.get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                info.get("latest")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        };
+        if download_url.is_empty() {
+            self.show_message(
+                "提示",
+                "这个版本没有提供可直接替换的可执行文件，请到发布页手动下载。",
+                true,
+                &release_url,
+            );
+            return;
+        }
+        let Some(digest) = digest else {
+            self.show_message(
+                "提示",
+                "这个版本缺少 SHA-256 校验信息，无法自动更新。请到发布页手动下载。",
+                true,
+                &release_url,
+            );
+            return;
+        };
+
+        self.begin_task("update_app");
+        self.set_status(format!("正在下载更新 {latest}…"));
+        let state = Arc::clone(self);
+        let downloader = Arc::clone(&self.downloader);
+        std::thread::spawn(move || {
+            let bytes = match download_release_bytes(&downloader, &download_url) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    state.end_task("update_app");
+                    state.show_message("更新失败", &error, true, &release_url);
+                    return;
+                }
+            };
+            if !update::verify_sha256(&bytes, &digest) {
+                state.end_task("update_app");
+                state.show_message(
+                    "更新失败",
+                    "更新包 SHA-256 校验失败，已取消安装。",
+                    true,
+                    &release_url,
+                );
+                return;
+            }
+
+            state.set_status("正在替换程序文件…");
+            let exe = match replace_running_executable(&bytes) {
+                Ok(exe) => exe,
+                Err(error) => {
+                    state.end_task("update_app");
+                    state.show_message("更新失败", &error, true, &release_url);
+                    return;
+                }
+            };
+
+            state.set_status("更新完成，正在重启…");
+            match spawn_restarted_exe(&exe) {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    state.end_task("update_app");
+                    state.show_message(
+                        "更新失败",
+                        &format!("新版本已写入，但自动重启失败：{error}。请手动重新打开程序。"),
+                        true,
+                        &release_url,
+                    );
+                }
+            }
+        });
     }
 
     // --------------------------------------------------------------- swarm
@@ -1751,5 +1934,88 @@ mod tests {
             2000
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replaces_executable_and_keeps_a_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "gamemagnet-update-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("GameMagNet.exe");
+        std::fs::write(&exe, b"old").unwrap();
+
+        replace_executable_at(&exe, b"new").unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(dir.join("GameMagNet.exe.old")).unwrap(),
+            b"old"
+        );
+        assert!(!dir.join("GameMagNet.exe.new").exists());
+
+        replace_executable_at(&exe, b"newer").unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"newer");
+        assert_eq!(
+            std::fs::read(dir.join("GameMagNet.exe.old")).unwrap(),
+            b"new"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn downloads_release_bytes_with_mirror_fallback() {
+        let direct = "https://github.com/lzoreal/Game/releases/download/v1/GameMagNet.exe";
+        let proxied = format!("https://gh-proxy.com/{direct}");
+
+        let client = ScriptedClient::new(vec![(direct, Ok("direct".to_string()))]);
+        let downloader = Downloader::new(client);
+        assert_eq!(
+            download_release_bytes(&downloader, direct).unwrap(),
+            b"direct"
+        );
+
+        let client = ScriptedClient::new(vec![
+            (direct, Err("direct blocked".to_string())),
+            (proxied.as_str(), Ok("mirrored".to_string())),
+        ]);
+        let downloader = Downloader::new(client);
+        assert_eq!(
+            download_release_bytes(&downloader, direct).unwrap(),
+            b"mirrored"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn live_download_latest_update() {
+        use crate::net_reqwest::ReqwestClient;
+
+        let downloader = Arc::new(Downloader::new(Arc::new(ReqwestClient::new().unwrap())));
+        let result = crate::update::check_latest(
+            &downloader,
+            "lzoreal/Game",
+            "v1.0.0",
+            None,
+            Duration::from_secs(15),
+            crate::update::API_BASE,
+        )
+        .unwrap();
+        let url = result.release.download_url.expect("download url");
+        let bytes = download_release_bytes(&downloader, &url).unwrap();
+        assert!(!bytes.is_empty());
+        if let Some(digest) = result.release.download_digest.as_deref() {
+            assert!(crate::update::verify_sha256(&bytes, digest));
+        }
+        eprintln!(
+            "downloaded {} bytes from {} (digest={:?})",
+            bytes.len(),
+            url,
+            result.release.download_digest
+        );
     }
 }

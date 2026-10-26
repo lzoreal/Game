@@ -887,13 +887,13 @@ async function showUpdateDialog() {
     title: `发现新版本 ${info.latest || ''}`,
     sub: `当前版本 ${info.current || ''}  →  ${info.latest || ''}`,
     width: 'wide',
-    body: `<div style="color:var(--text);font-size:12px;margin-bottom:8px">${html(info.name || '')}</div>${html(notes)}`,
+    body: `<div style="color:var(--text);font-size:12px;margin-bottom:6px">${html(info.name || '')}</div><div style="color:var(--muted);font-size:11px;margin-bottom:10px">下载后将自动替换当前目录中的程序并重启。</div>${html(notes)}`,
     actions: [
       ...(info.url
         ? [{ label: '打开发布页', kind: 'ghost', onClick: () => invoke('open_external_url', { url: info.url }) }]
         : []),
       ...(info.downloadUrl
-        ? [{ label: '下载更新', kind: 'primary', onClick: () => invoke('open_external_url', { url: info.downloadUrl }) }]
+        ? [{ label: '下载并安装', kind: 'primary', onClick: () => invoke('install_update') }]
         : []),
       { label: '关闭', kind: 'soft' },
     ],

@@ -4,6 +4,11 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::mpsc;
+
 use chrono::NaiveDateTime;
 use serde_json::Value;
 
@@ -18,19 +23,68 @@ pub const REPACK_KEYS: [&str; 6] = [
     "repacks", "repack", "games", "items", "downloads", "sources",
 ];
 
-struct NormItem {
-    title: String,
-    uris: Vec<String>,
-    file_size: String,
-    upload_date: String,
-    description_html: String,
+pub fn group_key_id(key: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
-fn stringify(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Null => "None".to_string(),
-        other => other.to_string(),
+pub fn take_repacks(data: Value) -> Option<(Vec<Value>, String)> {
+    if let Value::Object(mut map) = data {
+        for key in REPACK_KEYS {
+            if let Some(Value::Array(items)) = map.remove(key) {
+                return Some((items, key.to_string()));
+            }
+        }
+        if let Some(items) = take_first_list(Value::Object(map), 0) {
+            return Some((items, "auto-detected".to_string()));
+        }
+        return None;
+    }
+
+    let Value::Array(items) = data else {
+        return None;
+    };
+    let Some(Value::Object(first)) = items.first() else {
+        return None;
+    };
+    let wanted = ["title", "uris", "url", "name", "magnet", "download"];
+    let detected = if wanted.iter().any(|key| first.contains_key(*key)) {
+        "auto-detected"
+    } else {
+        "root-list"
+    };
+    Some((items, detected.to_string()))
+}
+
+fn take_first_list(data: Value, depth: usize) -> Option<Vec<Value>> {
+    if depth > 3 {
+        return None;
+    }
+    match data {
+        Value::Array(items) => {
+            let Some(Value::Object(first)) = items.first() else {
+                return None;
+            };
+            let wanted = ["title", "uris", "url", "name", "magnet", "download"];
+            if wanted.iter().any(|key| first.contains_key(*key)) {
+                Some(items)
+            } else {
+                None
+            }
+        }
+        Value::Object(map) => {
+            for (_, value) in map {
+                if let Some(found) = take_first_list(value, depth + 1) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -77,30 +131,50 @@ fn find_first_list(data: &Value, depth: usize) -> Option<&Vec<Value>> {
     None
 }
 
-fn validate_repack_item(raw: &Value) -> Option<NormItem> {
-    let object = raw.as_object()?;
+fn take_field(object: &mut serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = object.remove(*key) {
+            return Some(match value {
+                Value::String(text) => text,
+                Value::Null => "None".to_string(),
+                other => other.to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn build_item(
+    raw: Value,
+    source_name: &Arc<str>,
+    source_display: &Arc<str>,
+    source_index: usize,
+) -> Option<Item> {
+    let Value::Object(mut object) = raw else {
+        return None;
+    };
 
     let mut title = None;
     for key in ["title", "name", "game", "description"] {
-        if let Some(Value::String(text)) = object.get(key) {
-            title = Some(text.clone());
+        if let Some(Value::String(text)) = object.remove(key) {
+            title = Some(text);
             break;
         }
     }
 
-    let mut uris = Vec::new();
+    let mut uris: Vec<Box<str>> = Vec::new();
     for key in [
         "uris", "uri", "urls", "url", "links", "link", "magnet", "torrent",
     ] {
-        match object.get(key) {
+        match object.remove(key) {
             Some(Value::Array(values)) => {
-                uris.extend(
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str().map(str::to_string)),
-                );
+                for value in values {
+                    if let Value::String(uri) = value {
+                        uris.push(uri.into_boxed_str());
+                    }
+                }
             }
-            Some(Value::String(value)) => uris.push(value.clone()),
+            Some(Value::String(uri)) => uris.push(uri.into_boxed_str()),
             _ => {}
         }
     }
@@ -109,79 +183,75 @@ fn validate_repack_item(raw: &Value) -> Option<NormItem> {
         return None;
     }
 
-    let file_size = ["fileSize", "size", "file_size"]
-        .iter()
-        .find_map(|key| object.get(*key))
-        .map(stringify)
+    let title = title.unwrap_or_else(|| "Unknown".to_string());
+    let file_size = take_field(&mut object, &["fileSize", "size", "file_size"])
         .unwrap_or_else(|| "N/A".to_string());
-    let upload_date = ["uploadDate", "date", "upload_date"]
-        .iter()
-        .find_map(|key| object.get(*key))
-        .map(stringify)
+    let upload_date = take_field(&mut object, &["uploadDate", "date", "upload_date"])
         .unwrap_or_else(|| "N/A".to_string());
-    let description_html = object
-        .get("descriptionHtml")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let description_html = match object.remove("descriptionHtml") {
+        Some(Value::String(text)) => text,
+        _ => String::new(),
+    };
 
-    Some(NormItem {
-        title: title.unwrap_or_else(|| "Unknown".to_string()),
+    let (nt, dkey) = crate::text::normalize_title(&title);
+    let key_id = group_key_id(&dkey);
+    let date_dt = parse_upload_date(Some(&upload_date));
+
+    Some(Item {
+        title: title.into_boxed_str(),
+        nt: nt.into_boxed_str(),
+        key_id,
         uris,
-        file_size,
-        upload_date,
-        description_html,
+        file_size: file_size.into_boxed_str(),
+        upload_date: upload_date.into_boxed_str(),
+        date_dt,
+        source_name: Arc::clone(source_name),
+        source_display: Arc::clone(source_display),
+        source_index,
+        description_html: description_html.into_boxed_str(),
     })
 }
 
 pub fn load_source(dir: &Path, name: &str) -> Result<(Vec<Item>, SourceMeta), String> {
     let path = dir.join(name);
     let data = storage::read_source_file(&path)?;
-    let (raw_items, detected_key) = extract_repacks(&data).ok_or_else(|| {
-        let keys = match &data {
-            Value::Object(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
-            other => other.to_string(),
-        };
-        format!("无法找到游戏列表字段。JSON 顶层字段: {keys}")
-    })?;
+    let keys = match &data {
+        Value::Object(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
+        other => other.to_string(),
+    };
+    let fallback_url = match &data {
+        Value::Object(map) => match map.get("url") {
+            Some(Value::String(text)) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let (raw_items, detected_key) = take_repacks(data)
+        .ok_or_else(|| format!("无法找到游戏列表字段。JSON 顶层字段: {keys}"))?;
 
     let display = display_name(name);
+    let source_name: Arc<str> = Arc::from(name);
+    let source_display: Arc<str> = Arc::from(display.as_str());
     let mut items = Vec::with_capacity(raw_items.len());
     let mut invalid = 0usize;
     for raw in raw_items {
-        let Some(norm) = validate_repack_item(raw) else {
-            invalid += 1;
-            continue;
-        };
-        let nt = normalize_text(&norm.title);
-        let key = dedup_key(&norm.title);
-        let date_dt = parse_upload_date(Some(&norm.upload_date));
-        let source_index = items.len();
-        items.push(Item {
-            title: norm.title,
-            nt,
-            dkey: key,
-            uris: norm.uris,
-            file_size: norm.file_size,
-            upload_date: norm.upload_date,
-            date_dt,
-            source_name: name.to_string(),
-            source_display: display.clone(),
-            source_index,
-            description_html: norm.description_html,
-        });
+        match build_item(raw, &source_name, &source_display, items.len()) {
+            Some(item) => items.push(item),
+            None => invalid += 1,
+        }
     }
 
     let mut url = storage::read_source_url(&path);
     if url.is_none() {
-        if let Value::Object(map) = &data {
-            if let Some(Value::String(fallback)) = map.get("url") {
-                let trimmed = fallback.trim();
-                if !trimmed.is_empty() {
-                    url = Some(trimmed.to_string());
-                }
-            }
-        }
+        url = fallback_url;
     }
 
     let meta = SourceMeta {
@@ -196,7 +266,7 @@ pub fn load_source(dir: &Path, name: &str) -> Result<(Vec<Item>, SourceMeta), St
     Ok((items, meta))
 }
 
-/// Load every source, handing each one to `on_source` as soon as it is ready.
+/// Load every source in parallel, handing each one to `on_source` as soon as it is ready.
 pub fn stream_sources(
     dir: &Path,
     progress: &mut dyn FnMut(usize, usize, &str),
@@ -204,17 +274,54 @@ pub fn stream_sources(
 ) -> Vec<String> {
     let names = storage::source_filenames(dir);
     let total = names.len();
-    let mut errors = Vec::new();
-    for (index, name) in names.iter().enumerate() {
-        progress(index + 1, total, name);
-        match load_source(dir, name) {
-            Ok((items, meta)) => {
-                on_source(name, items, meta);
-            }
-            Err(error) => errors.push(format!("{name}: {error}")),
-        }
+    if total == 0 {
+        return Vec::new();
     }
-    errors
+
+    let workers = std::env::var("GAMEMAGNET_LOAD_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1)
+        })
+        .clamp(1, 4)
+        .min(total);
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel::<(&str, Result<(Vec<Item>, SourceMeta), String>)>();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let names = &names;
+            let next = &next;
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                if index >= names.len() {
+                    break;
+                }
+                let name = names[index].as_str();
+                let result = load_source(dir, name).map_err(|error| format!("{name}: {error}"));
+                if sender.send((name, result)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(sender);
+
+        let mut errors = Vec::new();
+        let mut completed = 0usize;
+        for (name, result) in receiver {
+            completed += 1;
+            progress(completed, total, name);
+            match result {
+                Ok((items, meta)) => on_source(name, items, meta),
+                Err(error) => errors.push(error),
+            }
+        }
+        errors
+    })
 }
 
 fn cmp_date_desc(a: Option<NaiveDateTime>, b: Option<NaiveDateTime>) -> Ordering {
@@ -224,8 +331,8 @@ fn cmp_date_desc(a: Option<NaiveDateTime>, b: Option<NaiveDateTime>) -> Ordering
 pub fn finalize_group(mut items: Vec<Item>, score: f64) -> Group {
     let mut rep = 0usize;
     for (index, item) in items.iter().enumerate().skip(1) {
-        let candidate = (item.title.chars().count(), item.title.as_str());
-        let current = (items[rep].title.chars().count(), items[rep].title.as_str());
+        let candidate = (item.title.chars().count(), item.title.as_ref());
+        let current = (items[rep].title.chars().count(), items[rep].title.as_ref());
         if candidate < current {
             rep = index;
         }
@@ -245,9 +352,9 @@ pub fn finalize_group(mut items: Vec<Item>, score: f64) -> Group {
     }
     let newest = newest.unwrap_or(0);
 
-    let title = items[rep].title.clone();
-    let size = items[newest].file_size.clone();
-    let date_str = items[newest].upload_date.clone();
+    let title = items[rep].title.to_string();
+    let size = items[newest].file_size.to_string();
+    let date_str = items[newest].upload_date.to_string();
     let date_dt = items[newest].date_dt;
     let date_display = match date_dt {
         Some(dt) => format_date(&dt),
@@ -258,12 +365,14 @@ pub fn finalize_group(mut items: Vec<Item>, score: f64) -> Group {
     let mut uris = Vec::new();
     let mut seen_uris = HashSet::new();
     for item in &items {
-        if !sources.contains(&item.source_display) {
-            sources.push(item.source_display.clone());
+        let display = item.source_display.to_string();
+        if !sources.contains(&display) {
+            sources.push(display);
         }
         for uri in &item.uris {
+            let uri = uri.to_string();
             if seen_uris.insert(uri.clone()) {
-                uris.push(uri.clone());
+                uris.push(uri);
             }
         }
     }
@@ -290,16 +399,12 @@ struct Bucket {
 }
 
 fn add_hit(
-    buckets: &mut HashMap<String, Bucket>,
-    order: &mut Vec<String>,
+    buckets: &mut HashMap<u64, Bucket>,
+    order: &mut Vec<u64>,
     item: &Item,
     score: f64,
 ) {
-    let key = if item.dkey.is_empty() {
-        item.nt.clone()
-    } else {
-        item.dkey.clone()
-    };
+    let key = item.key_id;
     match buckets.get_mut(&key) {
         Some(bucket) => {
             bucket.items.push(item.clone());
@@ -308,7 +413,7 @@ fn add_hit(
             }
         }
         None => {
-            order.push(key.clone());
+            order.push(key);
             buckets.insert(
                 key,
                 Bucket {
@@ -333,16 +438,16 @@ pub fn search_items(
         return (Vec::new(), 0);
     }
 
-    let mut buckets: HashMap<String, Bucket> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut buckets: HashMap<u64, Bucket> = HashMap::new();
+    let mut order: Vec<u64> = Vec::new();
     let mut substring_hits = 0usize;
 
     for item in items {
-        if !source_filter.is_empty() && item.source_display != source_filter {
+        if !source_filter.is_empty() && item.source_display.as_ref() != source_filter {
             continue;
         }
         let Some(pos) = item.nt.find(&q) else { continue };
-        let score = if item.nt == q {
+        let score = if item.nt.as_ref() == q.as_str() {
             1.0
         } else {
             let coverage = q.chars().count() as f64 / item.nt.chars().count().max(1) as f64;
@@ -360,7 +465,7 @@ pub fn search_items(
         let min_shared = min_shared.max(1);
 
         for item in items {
-            if !source_filter.is_empty() && item.source_display != source_filter {
+            if !source_filter.is_empty() && item.source_display.as_ref() != source_filter {
                 continue;
             }
             let nt = &item.nt;
@@ -407,18 +512,14 @@ pub fn search_items(
 }
 
 pub fn latest_items(items: &[Item], source_filter: &str, limit: usize) -> (Vec<Group>, usize) {
-    let mut newest: HashMap<String, Option<NaiveDateTime>> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut newest: HashMap<u64, Option<NaiveDateTime>> = HashMap::new();
+    let mut order: Vec<u64> = Vec::new();
 
     for item in items {
-        if !source_filter.is_empty() && item.source_display != source_filter {
+        if !source_filter.is_empty() && item.source_display.as_ref() != source_filter {
             continue;
         }
-        let key = if item.dkey.is_empty() {
-            item.nt.clone()
-        } else {
-            item.dkey.clone()
-        };
+        let key = item.key_id;
         match item.date_dt {
             None => {
                 if !newest.contains_key(&key) {
@@ -447,17 +548,13 @@ pub fn latest_items(items: &[Item], source_filter: &str, limit: usize) -> (Vec<G
     });
     keys.truncate(limit);
 
-    let selected: HashSet<String> = keys.iter().cloned().collect();
-    let mut bucket_items: HashMap<String, Vec<Item>> = HashMap::new();
+    let selected: HashSet<u64> = keys.iter().cloned().collect();
+    let mut bucket_items: HashMap<u64, Vec<Item>> = HashMap::new();
     for item in items {
-        if !source_filter.is_empty() && item.source_display != source_filter {
+        if !source_filter.is_empty() && item.source_display.as_ref() != source_filter {
             continue;
         }
-        let key = if item.dkey.is_empty() {
-            item.nt.clone()
-        } else {
-            item.dkey.clone()
-        };
+        let key = item.key_id;
         if selected.contains(&key) {
             bucket_items.entry(key).or_default().push(item.clone());
         }
@@ -555,13 +652,7 @@ pub fn is_valid_repack(raw: &Value) -> bool {
 pub fn total_groups(items: &[Item]) -> usize {
     items
         .iter()
-        .map(|item| {
-            if item.dkey.is_empty() {
-                item.nt.as_str()
-            } else {
-                item.dkey.as_str()
-            }
-        })
+        .map(|item| item.key_id)
         .collect::<HashSet<_>>()
         .len()
 }
@@ -575,19 +666,18 @@ mod tests {
     use super::*;
 
     fn item(title: &str, source: &str, date: &str, uri: &str) -> Item {
-        let nt = normalize_text(title);
         Item {
-            title: title.to_string(),
-            dkey: dedup_key(title),
-            nt,
-            uris: vec![uri.to_string()],
-            file_size: "1 GB".to_string(),
-            upload_date: date.to_string(),
+            title: title.to_string().into_boxed_str(),
+            nt: normalize_text(title).into_boxed_str(),
+            key_id: group_key_id(&dedup_key(title)),
+            uris: vec![uri.to_string().into_boxed_str()],
+            file_size: "1 GB".into(),
+            upload_date: date.into(),
             date_dt: parse_upload_date(Some(date)),
-            source_name: source.to_string(),
-            source_display: source.to_string(),
+            source_name: Arc::from(source),
+            source_display: Arc::from(source),
             source_index: 0,
-            description_html: String::new(),
+            description_html: String::new().into_boxed_str(),
         }
     }
 
@@ -657,7 +747,6 @@ mod tests {
     fn measure_real_sources() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("..")
             .join("sources");
         let mut items: Vec<Item> = Vec::new();
         let mut sources = 0usize;
@@ -670,14 +759,12 @@ mod tests {
         let errors = stream_sources(&dir, &mut progress, &mut on_source);
         let mut title = 0usize;
         let mut nt = 0usize;
-        let mut dkey = 0usize;
         let mut desc = 0usize;
         let mut uris = 0usize;
         let mut uri_count = 0usize;
         for item in &items {
             title += item.title.len();
             nt += item.nt.len();
-            dkey += item.dkey.len();
             desc += item.description_html.len();
             for uri in &item.uris {
                 uris += uri.len();
@@ -692,12 +779,102 @@ mod tests {
             std::mem::size_of::<Item>()
         );
         eprintln!(
-            "bytes title={title} nt={nt} dkey={dkey} desc={desc} uris={uris} uri_count={uri_count}"
+            "bytes title={title} nt={nt} desc={desc} uris={uris} uri_count={uri_count}"
         );
         eprintln!(
             "total_string_bytes={}",
-            title + nt + dkey + desc + uris
+            title + nt + desc + uris
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_parts() {
+        use std::io::Read;
+        use std::time::Instant;
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("sources");
+        for name in ["rutor.json.gz", "skidrow_cleaned.json.gz", "fitgirl.json.gz"] {
+            let path = dir.join(name);
+            let started = Instant::now();
+            let file = std::fs::File::open(&path).unwrap();
+            let mut bytes = Vec::new();
+            flate2::read::GzDecoder::new(file)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            let decompress = started.elapsed().as_millis();
+
+            let started = Instant::now();
+            let data: Value = serde_json::from_slice(&bytes).unwrap();
+            let parse = started.elapsed().as_millis();
+            drop(bytes);
+
+            let started = Instant::now();
+            let (raw_items, _) = take_repacks(data).unwrap();
+            let split = started.elapsed().as_millis();
+
+            let started = Instant::now();
+            let source_name: Arc<str> = Arc::from(name);
+            let display: Arc<str> = Arc::from(display_name(name));
+            let mut count = 0usize;
+            for raw in raw_items {
+                if build_item(raw, &source_name, &display, count).is_some() {
+                    count += 1;
+                }
+            }
+            let build = started.elapsed().as_millis();
+            eprintln!(
+                "{name}: decompress={decompress}ms parse={parse}ms split={split}ms build={build}ms items={count}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_load_and_search() {
+        use std::time::Instant;
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("sources");
+        let names = crate::storage::source_filenames(&dir);
+        let mut items: Vec<Item> = Vec::new();
+        let total_start = Instant::now();
+        for name in &names {
+            let started = Instant::now();
+            let (source_items, meta) = load_source(&dir, name).unwrap();
+            eprintln!(
+                "load {} items={} {}ms",
+                meta.display,
+                source_items.len(),
+                started.elapsed().as_millis()
+            );
+            items.extend(source_items);
+        }
+        eprintln!("load_total {}ms", total_start.elapsed().as_millis());
+
+        let started = Instant::now();
+        let (groups, total) = latest_items(&items, "", 100);
+        eprintln!(
+            "latest {}ms groups={} total={}",
+            started.elapsed().as_millis(),
+            groups.len(),
+            total
+        );
+
+        for query in ["hades", "hadesz", "cyberpunk"] {
+            let started = Instant::now();
+            let (groups, total) = search_items(&items, query, true, 0.3, "", 1000);
+            eprintln!(
+                "search {:?} {}ms groups={} total={}",
+                query,
+                started.elapsed().as_millis(),
+                groups.len(),
+                total
+            );
+        }
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub struct ReleaseInfo {
     pub url: String,
     #[serde(rename = "downloadUrl")]
     pub download_url: Option<String>,
+    #[serde(rename = "downloadDigest")]
+    pub download_digest: Option<String>,
     pub notes: String,
     #[serde(rename = "publishedAt")]
     pub published_at: String,
@@ -30,6 +32,16 @@ pub struct UpdateResult {
     #[serde(rename = "updateAvailable")]
     pub update_available: bool,
     pub release: ReleaseInfo,
+}
+
+pub fn verify_sha256(bytes: &[u8], digest: &str) -> bool {
+    let expected = digest
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(digest.trim())
+        .to_lowercase();
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes)) == expected
 }
 
 pub fn parse_version(value: &str) -> Vec<u64> {
@@ -129,18 +141,37 @@ pub fn check_latest(
     let tag = tag_value.as_str().unwrap_or("").trim().to_string();
 
     let mut download_url = None;
+    let mut download_digest = None;
     if let Some(Value::Array(assets)) = payload.get("assets") {
+        let mut best: Option<(u8, String, Option<String>)> = None;
         for asset in assets {
             let Some(candidate) = asset.get("browser_download_url").and_then(Value::as_str) else {
                 continue;
             };
-            if candidate.to_lowercase().ends_with(".exe") {
-                download_url = Some(candidate.to_string());
-                break;
+            let asset_name = asset.get("name").and_then(Value::as_str).unwrap_or("");
+            let digest = asset
+                .get("digest")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let rank = if asset_name.eq_ignore_ascii_case("GameMagNet.exe") {
+                3
+            } else if candidate.to_lowercase().ends_with(".exe")
+                && !asset_name.to_lowercase().contains("setup")
+            {
+                2
+            } else if candidate.to_lowercase().ends_with(".exe") {
+                1
+            } else {
+                0
+            };
+            match &best {
+                Some((best_rank, _, _)) if *best_rank >= rank => {}
+                _ => best = Some((rank, candidate.to_string(), digest)),
             }
-            if download_url.is_none() {
-                download_url = Some(candidate.to_string());
-            }
+        }
+        if let Some((_, url, digest)) = best {
+            download_url = Some(url);
+            download_digest = digest;
         }
     }
 
@@ -159,6 +190,7 @@ pub fn check_latest(
             .unwrap_or("")
             .to_string(),
         download_url,
+        download_digest,
         notes: payload
             .get("body")
             .and_then(Value::as_str)
@@ -224,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_exe_asset() {
+    fn prefers_portable_exe_over_installer() {
         let body = r#"{
             "tag_name": "v1.3",
             "name": "GameMagNet v1.3",
@@ -232,8 +264,9 @@ mod tests {
             "body": "notes",
             "published_at": "2026-01-01T00:00:00Z",
             "assets": [
-                {"browser_download_url": "https://example.com/a.zip"},
-                {"browser_download_url": "https://example.com/GameMagNet.exe"}
+                {"name": "GameMagNet_1.3.0_x64-setup.exe", "browser_download_url": "https://example.com/setup.exe", "digest": "sha256:aaa"},
+                {"name": "GameMagNet-windows.zip", "browser_download_url": "https://example.com/a.zip"},
+                {"name": "GameMagNet.exe", "browser_download_url": "https://example.com/GameMagNet.exe", "digest": "sha256:bbb"}
             ]
         }"#;
         let client = downloader(200, body);
@@ -251,6 +284,18 @@ mod tests {
             result.release.download_url.as_deref(),
             Some("https://example.com/GameMagNet.exe")
         );
+        assert_eq!(
+            result.release.download_digest.as_deref(),
+            Some("sha256:bbb")
+        );
+    }
+
+    #[test]
+    fn verifies_sha256_digests() {
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(verify_sha256(b"abc", hash));
+        assert!(verify_sha256(b"abc", &format!("sha256:{hash}")));
+        assert!(!verify_sha256(b"abd", hash));
     }
 
     #[test]

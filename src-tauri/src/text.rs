@@ -71,6 +71,17 @@ pub fn dedup_key(title: &str) -> String {
     }
 }
 
+pub fn normalize_title(value: &str) -> (String, String) {
+    let lowered = lower_nfkc(value);
+    let nt = collapse_alnum(&lowered);
+    let stripped = version_re().replace_all(&lowered, " ");
+    let mut key = collapse_alnum(&stripped);
+    if key.is_empty() {
+        key = nt.clone();
+    }
+    (nt, key)
+}
+
 pub fn display_name(filename: &str) -> String {
     let lower = filename.to_lowercase();
     let stem = if lower.ends_with(".json.gz") {
@@ -119,6 +130,15 @@ mod tests {
         assert_eq!(normalize_text("  Cyberpunk 2077: Deluxe!  "), "cyberpunk 2077 deluxe");
         assert_eq!(dedup_key("Game v1.2.3 Deluxe!"), "game deluxe");
         assert_eq!(dedup_key("Game v1.2 Deluxe"), dedup_key("game  deluxe"));
+    }
+
+    #[test]
+    fn shared_normalization_matches_individual_helpers() {
+        for title in ["Game v1.2.3 Deluxe!", "  Cyberpunk 2077  ", "v1.2.3", "特别版 v2.0"] {
+            let (nt, key) = normalize_title(title);
+            assert_eq!(nt, normalize_text(title));
+            assert_eq!(key, dedup_key(title));
+        }
     }
 
     #[test]

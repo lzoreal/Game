@@ -1,21 +1,24 @@
 //! Shared data types for the catalog.
 
+use std::sync::Arc;
+
 use chrono::NaiveDateTime;
 use serde::Serialize;
 
 #[derive(Clone, Debug)]
 pub struct Item {
-    pub title: String,
-    pub nt: String,
-    pub dkey: String,
-    pub uris: Vec<String>,
-    pub file_size: String,
-    pub upload_date: String,
+    pub title: Box<str>,
+    pub nt: Box<str>,
+    /// Interned dedup key; equal ids mean the same game group.
+    pub key_id: u64,
+    pub uris: Vec<Box<str>>,
+    pub file_size: Box<str>,
+    pub upload_date: Box<str>,
     pub date_dt: Option<NaiveDateTime>,
-    pub source_name: String,
-    pub source_display: String,
+    pub source_name: Arc<str>,
+    pub source_display: Arc<str>,
     pub source_index: usize,
-    pub description_html: String,
+    pub description_html: Box<str>,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
