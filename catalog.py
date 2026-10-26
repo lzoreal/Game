@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.1"
 MAX_RESULTS = 1000
 LATEST_LIMIT = 100
 SOURCE_URL_SUFFIX = ".source-url"
