@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hydra_sources import SourceDelta, SourceLibrary
+from source_library import SourceDelta, SourceLibrary
 
 
 def item(title, dkey, count=1):

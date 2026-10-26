@@ -10,7 +10,7 @@ from urllib.parse import quote, unquote_to_bytes, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import hydra_swarm as swarm
+import swarm_stats as swarm
 
 INFO_HASH = bytes.fromhex("0123456789abcdef0123456789abcdef01234567")
 

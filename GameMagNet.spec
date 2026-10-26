@@ -72,7 +72,7 @@ QT_CONFIG_EXCLUDES = [
 ]
 
 a = Analysis(
-    [str(ROOT / "hydra_qml_app.py")],
+    [str(ROOT / "main.py")],
     pathex=[str(ROOT)],
     binaries=[],
     datas=[

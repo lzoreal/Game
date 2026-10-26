@@ -5,8 +5,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import hydra_core as core
-from hydra_details import build_detail, card_key
+import catalog as core
+from detail_model import build_detail, card_key
 
 
 def item(source="alpha", uris=None, date="2025-01-02", description=""):

@@ -15,9 +15,9 @@ try:
     from PySide6.QtQuickControls2 import QQuickStyle
     from PySide6.QtTest import QTest
 
-    import hydra_core as core
-    import hydra_qml_backend as backend_module
-    import hydra_qml_theme as theme_module
+    import catalog as core
+    import app_backend as backend_module
+    import theme_tokens as theme_module
     PYSIDE_AVAILABLE = True
 except ImportError:
     PYSIDE_AVAILABLE = False

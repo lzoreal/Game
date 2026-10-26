@@ -5,7 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 
-import hydra_core as core
+import catalog as core
 
 
 class SourceCommandError(RuntimeError):

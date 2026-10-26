@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import hydra_core as core
+import catalog as core
 
 
 def payload(title="Alpha", uri="magnet:a"):

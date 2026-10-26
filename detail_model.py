@@ -3,7 +3,7 @@
 import json
 from dataclasses import dataclass
 
-import hydra_core as core
+import catalog as core
 
 LINK_LIMIT = 6
 RAW_LIMIT = 100000

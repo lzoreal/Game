@@ -1,6 +1,6 @@
 """GUI-free task functions for the local game catalog manager."""
 
-import hydra_core as core
+import catalog as core
 
 
 def load_sources(sources_dir, report):

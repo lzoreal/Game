@@ -8,8 +8,8 @@ from PySide6.QtGui import QFont, QGuiApplication, QIcon
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
-import hydra_qml_backend as backend_module
-import hydra_qml_theme as theme_module
+import app_backend as backend_module
+import theme_tokens as theme_module
 
 
 def app_base_dir():

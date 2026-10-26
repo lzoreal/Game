@@ -18,16 +18,16 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 
-import hydra_bt as bt
-import hydra_core as core
-import hydra_details as details_lib
-import hydra_search as search_lib
-import hydra_source_commands as commands_lib
-import hydra_sources as sources_lib
-import hydra_swarm as swarm
-import hydra_tasks as task_lib
-import hydra_updates as updates
-from hydra_ui_tasks import TaskRunner
+import bt_clients as bt
+import catalog as core
+import catalog_tasks as task_lib
+import detail_model as details_lib
+import search_controller as search_lib
+import source_commands as commands_lib
+import source_library as sources_lib
+import swarm_stats as swarm
+import update_check as updates
+from task_runner import TaskRunner
 
 UPDATE_REPO = "lzoreal/Game"
 

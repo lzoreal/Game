@@ -6,21 +6,21 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import hydra_core
-import hydra_tasks
+import catalog
+import catalog_tasks
 
 
 def write_source(path, title, uri):
     data = {"downloads": [{"title": title, "uris": [uri]}]}
-    hydra_core.write_source_file(path, data)
+    catalog.write_source_file(path, data)
     return data
 
 
 def search_item(title, source="test", date="2025-01-01", uri="magnet:?xt=urn:btih:test"):
     return {
         "title": title,
-        "nt": hydra_core.normalize_text(title),
-        "dkey": hydra_core.dedup_key(title),
+        "nt": catalog.normalize_text(title),
+        "dkey": catalog.dedup_key(title),
         "source_display": source,
         "uris": [uri],
         "fileSize": "1 GB",
@@ -43,7 +43,7 @@ class LoadTaskTests(TaskTestBase):
         write_source(os.path.join(sources, "a.json.gz"), "Alpha", "magnet:a")
         write_source(os.path.join(sources, "b.json.gz"), "Beta", "magnet:b")
         events = []
-        (errors,) = hydra_tasks.load_sources(
+        (errors,) = catalog_tasks.load_sources(
             sources, lambda event, payload: events.append((event, payload))
         )
         self.assertEqual(errors, [])
@@ -63,7 +63,7 @@ class LoadTaskTests(TaskTestBase):
         with open(os.path.join(sources, "bad.json"), "w", encoding="utf-8") as handle:
             handle.write("{not json")
         events = []
-        (errors,) = hydra_tasks.load_sources(
+        (errors,) = catalog_tasks.load_sources(
             sources, lambda event, payload: events.append((event, payload))
         )
         self.assertEqual(len(errors), 1)
@@ -78,7 +78,7 @@ class SearchTaskTests(unittest.TestCase):
             search_item("Cyberpunk 2077"),
             search_item("Vampire Survivors"),
         ]
-        groups, total = hydra_tasks.search_sources(
+        groups, total = catalog_tasks.search_sources(
             items, "cyberpunk", True, 0.3, ""
         )
         self.assertEqual(total, 1)
@@ -93,7 +93,7 @@ class LatestTaskTests(unittest.TestCase):
             search_item("Newest Game", date="2025-05-01", uri="magnet:newest"),
             search_item("Middle Game", date="2024-11-01", uri="magnet:middle"),
         ]
-        groups, total = hydra_tasks.latest_sources(items, "", 2)
+        groups, total = catalog_tasks.latest_sources(items, "", 2)
         self.assertEqual(total, 3)
         self.assertEqual([group["title"] for group in groups], ["Newest Game", "Middle Game"])
         self.assertEqual(groups[0]["date_dt"].year, 2025)
@@ -103,7 +103,7 @@ class LatestTaskTests(unittest.TestCase):
             search_item("Same Game", date="2024-01-01", uri="magnet:a"),
             search_item("Same Game", date="2025-02-02", uri="magnet:b"),
         ]
-        groups, total = hydra_tasks.latest_sources(items)
+        groups, total = catalog_tasks.latest_sources(items)
         self.assertEqual(total, 1)
         self.assertEqual(len(groups), 1)
         self.assertEqual(len(groups[0]["uris"]), 2)
@@ -115,7 +115,7 @@ class LatestTaskTests(unittest.TestCase):
             search_item("Beta One", source="beta", date="2025-01-01"),
             search_item("Alpha Undated", source="alpha", date="N/A"),
         ]
-        groups, total = hydra_tasks.latest_sources(items, "alpha")
+        groups, total = catalog_tasks.latest_sources(items, "alpha")
         self.assertEqual(total, 2)
         self.assertEqual(
             [group["title"] for group in groups], ["Alpha One", "Alpha Undated"]
@@ -126,7 +126,7 @@ class LatestTaskTests(unittest.TestCase):
             search_item("Game %03d" % index, date="2025-01-%02d" % (index % 28 + 1))
             for index in range(120)
         ]
-        groups, total = hydra_tasks.latest_sources(items)
+        groups, total = catalog_tasks.latest_sources(items)
         self.assertEqual(total, 120)
         self.assertEqual(len(groups), 100)
 

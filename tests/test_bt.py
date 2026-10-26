@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import hydra_bt
+import bt_clients
 
 
 class FakeProbe:
@@ -47,7 +47,7 @@ QUARK = r"C:\Quark\quark.exe"
 
 class CatalogTests(unittest.TestCase):
     def test_catalog_consistency(self):
-        keys = [entry["key"] for entry in hydra_bt.CATALOG]
+        keys = [entry["key"] for entry in bt_clients.CATALOG]
         self.assertEqual(len(keys), len(set(keys)))
         self.assertEqual(
             keys,
@@ -62,7 +62,7 @@ class CatalogTests(unittest.TestCase):
                 "thunder",
             ],
         )
-        for entry in hydra_bt.CATALOG:
+        for entry in bt_clients.CATALOG:
             for field in ("key", "name", "badge", "color", "desc", "url"):
                 self.assertTrue(entry.get(field), f"{entry.get('key')} missing {field}")
             self.assertIn(entry.get("args"), ("uri", "none"))
@@ -76,7 +76,7 @@ class CatalogTests(unittest.TestCase):
                 self.assertTrue(entry.get("paths"))
                 self.assertEqual(entry["args"], "uri")
                 self.assertIsNone(entry["fallback"])
-        self.assertTrue(hydra_bt.CATALOG[0].get("recommended"))
+        self.assertTrue(bt_clients.CATALOG[0].get("recommended"))
 
 
 class DetectionTests(unittest.TestCase):
@@ -86,7 +86,7 @@ class DetectionTests(unittest.TestCase):
             handler={"exe": QUARK, "command": f'"{QUARK}" "%1"'},
             thunder=THUNDER,
         )
-        targets = hydra_bt.detect(probe)
+        targets = bt_clients.detect(probe)
         self.assertEqual([target["key"] for target in targets], ["qbittorrent", "thunder", "__system__"])
         self.assertEqual([target["kind"] for target in targets], ["client", "client", "system"])
         self.assertEqual(targets[-1]["name"], "quark")
@@ -96,20 +96,20 @@ class DetectionTests(unittest.TestCase):
             existing=(QBITTORRENT,),
             handler={"exe": QBITTORRENT, "command": f'"{QBITTORRENT}" "%1"'},
         )
-        targets = hydra_bt.detect(probe)
+        targets = bt_clients.detect(probe)
         self.assertEqual([target["key"] for target in targets], ["qbittorrent"])
         self.assertFalse(any(target["kind"] == "system" for target in targets))
 
     def test_no_targets(self):
         probe = FakeProbe()
-        self.assertEqual(hydra_bt.detect(probe), [])
+        self.assertEqual(bt_clients.detect(probe), [])
 
     def test_app_path_fallback(self):
         probe = FakeProbe(
             existing=(),
             app_paths={"qbittorrent.exe": r"C:\Portable\qbittorrent.exe"},
         )
-        targets = hydra_bt.detect(probe)
+        targets = bt_clients.detect(probe)
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0]["key"], "qbittorrent")
         self.assertEqual(targets[0]["exe"], r"C:\Portable\qbittorrent.exe")
@@ -118,7 +118,7 @@ class DetectionTests(unittest.TestCase):
 class PlanTests(unittest.TestCase):
     def test_qbittorrent_plan_uses_uri_argument(self):
         target = {"key": "qbittorrent", "name": "qBittorrent", "kind": "client", "exe": QBITTORRENT}
-        result = hydra_bt.plan("magnet:?xt=urn:btih:abc", target)
+        result = bt_clients.plan("magnet:?xt=urn:btih:abc", target)
         self.assertEqual(result["kind"], "process")
         self.assertEqual(result["exe"], QBITTORRENT)
         self.assertEqual(result["args"], ["magnet:?xt=urn:btih:abc"])
@@ -127,7 +127,7 @@ class PlanTests(unittest.TestCase):
 
     def test_thunder_plan_is_no_arg_with_shell_fallback(self):
         target = {"key": "thunder", "name": "迅雷", "kind": "client", "exe": THUNDER}
-        result = hydra_bt.plan("magnet:?xt=urn:btih:def", target)
+        result = bt_clients.plan("magnet:?xt=urn:btih:def", target)
         self.assertEqual(result["kind"], "process")
         self.assertEqual(result["args"], [])
         self.assertEqual(result["clipboard"], "magnet:?xt=urn:btih:def")
@@ -135,13 +135,13 @@ class PlanTests(unittest.TestCase):
 
     def test_system_plan_is_shell(self):
         target = {"key": "__system__", "name": "quark", "kind": "system", "exe": QUARK}
-        result = hydra_bt.plan("magnet:?xt=urn:btih:ghi", target)
+        result = bt_clients.plan("magnet:?xt=urn:btih:ghi", target)
         self.assertEqual(result["kind"], "shell")
         self.assertEqual(result["clipboard"], "magnet:?xt=urn:btih:ghi")
 
     def test_unknown_target_has_no_plan(self):
-        self.assertIsNone(hydra_bt.plan("magnet:x", None))
-        self.assertIsNone(hydra_bt.plan("magnet:x", {"key": "unknown", "kind": "client"}))
+        self.assertIsNone(bt_clients.plan("magnet:x", None))
+        self.assertIsNone(bt_clients.plan("magnet:x", {"key": "unknown", "kind": "client"}))
 
 
 if __name__ == "__main__":

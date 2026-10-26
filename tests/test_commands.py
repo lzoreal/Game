@@ -7,8 +7,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import hydra_core
-from hydra_source_commands import (
+import catalog
+from source_commands import (
     SourceCommandError,
     SourceCommands,
     SourceExists,
@@ -23,7 +23,7 @@ def payload(title="Alpha", uri="magnet:a"):
 
 def write_source(path, title="Old", uri="magnet:old"):
     data = payload(title, uri)
-    hydra_core.write_source_file(path, data)
+    catalog.write_source_file(path, data)
     return data
 
 
@@ -35,7 +35,7 @@ def write_plain(path, title="Old", uri="magnet:old"):
 
 
 def read_source(path):
-    return hydra_core.read_source_file(path)
+    return catalog.read_source_file(path)
 
 
 class FakeDownloader:
@@ -137,7 +137,7 @@ class UpdateTests(CommandTestBase):
     def test_update_reads_url_sidecar_and_writes_gzip(self):
         path = self.path("a.json.gz")
         write_source(path, "Old")
-        hydra_core.write_url_file(path, "https://example.com/a.json")
+        catalog.write_url_file(path, "https://example.com/a.json")
         commands = self.commands(
             {"https://example.com/a.json": json.dumps(payload("New"))}
         )
@@ -151,7 +151,7 @@ class UpdateTests(CommandTestBase):
     def test_update_uses_explicit_url_and_updates_sidecar(self):
         path = self.path("a.json.gz")
         write_source(path, "Old")
-        hydra_core.write_url_file(path, "https://example.com/old.json")
+        catalog.write_url_file(path, "https://example.com/old.json")
         commands = self.commands(
             {"https://example.com/new.json": json.dumps(payload("New"))}
         )
@@ -164,7 +164,7 @@ class UpdateTests(CommandTestBase):
     def test_update_failure_includes_filename(self):
         path = self.path("a.json.gz")
         write_source(path, "Old")
-        hydra_core.write_url_file(path, "https://example.com/bad.json")
+        catalog.write_url_file(path, "https://example.com/bad.json")
         commands = self.commands({}, {"https://example.com/bad.json"})
 
         with self.assertRaises(SourceCommandError) as ctx:
@@ -229,10 +229,10 @@ class DeleteTests(CommandTestBase):
     def test_delete_removes_sidecars_for_gzip_and_legacy_plain(self):
         path = self.path("a.json.gz")
         write_source(path)
-        hydra_core.write_url_file(path, "https://example.com/a.json")
+        catalog.write_url_file(path, "https://example.com/a.json")
         legacy = self.path("a.json")
         write_plain(legacy)
-        hydra_core.write_url_file(legacy, "https://example.com/legacy.json")
+        catalog.write_url_file(legacy, "https://example.com/legacy.json")
 
         change = self.commands().delete("a.json.gz")
 
@@ -252,8 +252,8 @@ class RefreshTests(CommandTestBase):
         no_url = self.path("c.json.gz")
         for target in (good, bad, no_url):
             write_source(target, "Old")
-        hydra_core.write_url_file(good, "https://example.com/a.json")
-        hydra_core.write_url_file(bad, "https://example.com/b.json")
+        catalog.write_url_file(good, "https://example.com/a.json")
+        catalog.write_url_file(bad, "https://example.com/b.json")
         commands = self.commands(
             {"https://example.com/a.json": json.dumps(payload("New"))},
             {"https://example.com/b.json"},
@@ -277,8 +277,8 @@ class RefreshTests(CommandTestBase):
         second = self.path("b.json.gz")
         write_source(first)
         write_source(second)
-        hydra_core.write_url_file(first, "https://example.com/a.json")
-        hydra_core.write_url_file(second, "https://example.com/b.json")
+        catalog.write_url_file(first, "https://example.com/a.json")
+        catalog.write_url_file(second, "https://example.com/b.json")
         commands = self.commands(
             {"https://example.com/a.json": json.dumps(payload("New"))}
         )

@@ -6,7 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    import hydra_qml_app
+    import main
     PYSIDE_AVAILABLE = True
 except ImportError:
     PYSIDE_AVAILABLE = False
@@ -16,8 +16,8 @@ except ImportError:
 class AppBaseDirTests(unittest.TestCase):
     def test_uses_script_directory_when_running_from_source(self):
         self.assertFalse(getattr(sys, "frozen", False))
-        expected = os.path.dirname(os.path.abspath(hydra_qml_app.__file__))
-        self.assertEqual(hydra_qml_app.app_base_dir(), expected)
+        expected = os.path.dirname(os.path.abspath(main.__file__))
+        self.assertEqual(main.app_base_dir(), expected)
 
     def test_uses_executable_directory_when_frozen(self):
         had_frozen = hasattr(sys, "frozen")
@@ -29,7 +29,7 @@ class AppBaseDirTests(unittest.TestCase):
                 "C:\\", "Portable", "GameMagNet", "GameMagNet.exe"
             )
             self.assertEqual(
-                hydra_qml_app.app_base_dir(),
+                main.app_base_dir(),
                 os.path.join("C:\\", "Portable", "GameMagNet"),
             )
         finally:
@@ -49,7 +49,7 @@ class PackagingSpecTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(spec_path))
         with open(spec_path, encoding="utf-8") as handle:
             spec = handle.read()
-        self.assertIn("hydra_qml_app.py", spec)
+        self.assertIn("main.py", spec)
         self.assertIn('ROOT / "qml"', spec)
         self.assertIn('ROOT / "assets"', spec)
 

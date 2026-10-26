@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import hydra_updates as updates
+import update_check as updates
 
 
 def release_payload(tag="v4.1", assets=None, body="Release notes", name="GameMagNet 4.1"):
