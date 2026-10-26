@@ -58,6 +58,13 @@ class ChallengeDetectionTests(unittest.TestCase):
             core.is_cloudflare_challenge(200, {}, b"Just a moment...")
         )
         self.assertFalse(core.is_cloudflare_challenge(404, {}, b""))
+        # A Cloudflare-fronted API can answer 403 with real JSON; that is a
+        # plain HTTP error, not an interstitial we should retry.
+        self.assertFalse(
+            core.is_cloudflare_challenge(
+                403, {"Server": "cloudflare"}, b'{"error":"forbidden"}'
+            )
+        )
 
 
 class ImpersonatingDownloadTests(unittest.TestCase):
@@ -83,6 +90,10 @@ class ImpersonatingDownloadTests(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("Cloudflare 人机验证", message)
         self.assertIn("chrome", message)
+        self.assertIn("从本地导入", message)
+        self.assertEqual(
+            ctx.exception.url, "https://mirror.example/list.json"
+        )
         self.assertEqual(len(module.calls), len(core.IMPERSONATE_PROFILES))
 
     def test_reports_http_errors_without_retrying(self):
@@ -141,6 +152,7 @@ class UrllibFallbackTests(unittest.TestCase):
                     core.Downloader().download_json("https://example.test/a.json")
 
         self.assertIn("Cloudflare", str(ctx.exception))
+        self.assertEqual(ctx.exception.url, "https://example.test/a.json")
 
 
 if __name__ == "__main__":

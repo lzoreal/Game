@@ -100,7 +100,7 @@ class Backend(QObject):
     btTargetsChanged = Signal()
     updateInfoChanged = Signal()
 
-    messageRequested = Signal(str, str, bool)
+    messageRequested = Signal(str, str, bool, str)
     overwriteRequested = Signal(str)
     updateDialogRequested = Signal()
     toastRequested = Signal(str)
@@ -139,6 +139,7 @@ class Backend(QObject):
         self._update_info = {}
         self._pending_name = ""
         self._pending_fetched = None
+        self._download_url = ""
         self._detail_title = ""
         self._detail_sources = []
         self._detail_meta = ""
@@ -414,7 +415,13 @@ class Backend(QObject):
             else:
                 self.show_message("操作失败", error, True)
             return
-        self.show_message("操作失败", error, True)
+        self.show_message(
+            "操作失败", error, True, self._cloudflare_link(error, self._download_url)
+        )
+
+    @staticmethod
+    def _cloudflare_link(error, url):
+        return url if "Cloudflare" in str(error or "") else ""
 
     def on_tasks_changed(self):
         self.update_busy()
@@ -724,6 +731,7 @@ class Backend(QObject):
         )
         self._pending_name = name
         self._pending_fetched = None
+        self._download_url = url
         self.status = "正在下载源…"
 
         def task(report):
@@ -772,6 +780,11 @@ class Backend(QObject):
         if not name:
             self.show_message("提示", "请先在左侧选择一个源。", False)
             return
+        self._download_url = (
+            str(url or "").strip()
+            or core.read_source_url(os.path.join(self.sources_dir, name))
+            or ""
+        )
         self.status = "正在更新源…"
 
         def task(report):
@@ -857,7 +870,20 @@ class Backend(QObject):
     def on_refreshed(self, result):
         lines = [f"成功更新 {len(result.updated)} 个源，失败 {len(result.failed)} 个"]
         lines.extend(f"{name}: {error}" for name, error in result.failed[:5])
-        self.show_message("刷新完成", "\n".join(lines), False)
+        blocked = []
+        for name, error in result.failed:
+            if "Cloudflare" not in str(error or ""):
+                continue
+            url = core.read_source_url(os.path.join(self.sources_dir, name))
+            if url:
+                blocked.append(url)
+        if blocked:
+            lines.append("")
+            lines.append("受 Cloudflare 拦截的地址：")
+            lines.extend(blocked[:5])
+        self.show_message(
+            "刷新完成", "\n".join(lines), False, blocked[0] if len(blocked) == 1 else ""
+        )
         self.load_sources()
 
     # -------------------------------------------------------------- update
@@ -959,8 +985,14 @@ class Backend(QObject):
             self.show_message("启动失败", str(exc), True)
 
     # ------------------------------------------------------------- helpers
-    def show_message(self, title, text, error):
-        self.messageRequested.emit(title, text, bool(error))
+    def show_message(self, title, text, error, link=""):
+        self.messageRequested.emit(title, text, bool(error), link or "")
+
+    @Slot(str)
+    def open_external_url(self, url):
+        text = str(url or "").strip()
+        if text.startswith(("http://", "https://")):
+            QDesktopServices.openUrl(QUrl(text))
 
     def ready_status(self):
         if not self.library.metas:

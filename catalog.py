@@ -50,6 +50,9 @@ CF_BODY_MARKERS = (
     "attention required",
     "cf-mitigated",
     "enable javascript and cookies to continue",
+    "请稍候",
+    "正在验证您是否是真人",
+    "验证您是人类",
 )
 
 _CURL_CFFI = None
@@ -76,7 +79,7 @@ def is_cloudflare_challenge(status, headers, body):
     header_text = " ".join(
         f"{key}:{value}" for key, value in (headers or {}).items()
     ).lower()
-    if "cloudflare" in header_text or "cf-mitigated" in header_text:
+    if "cf-mitigated" in header_text:
         return True
     if isinstance(body, (bytes, bytearray)):
         snippet = body[:8192].decode("utf-8", "ignore")
@@ -86,8 +89,18 @@ def is_cloudflare_challenge(status, headers, body):
     return any(marker in snippet for marker in CF_BODY_MARKERS)
 
 
+CF_BLOCKED_HINT = (
+    "需要执行 JavaScript 的验证无法自动绕过：可在浏览器中打开该地址，"
+    "保存返回的 JSON 后通过「从本地导入 JSON」导入；或改用其他镜像地址。"
+)
+
+
 class CloudflareBlocked(RuntimeError):
-    """Raised when every browser fingerprint is still challenged."""
+    """Raised when a Cloudflare challenge cannot be solved without a browser."""
+
+    def __init__(self, message, url=""):
+        super().__init__(message)
+        self.url = url
 
 
 _VERSION_RE = re.compile(r"\bv\d+(?:\.\d+)+\w*\b", re.I)
@@ -583,7 +596,8 @@ class Downloader:
         raise CloudflareBlocked(
             "下载失败: 目标站点启用了 Cloudflare 人机验证，"
             f"已尝试 {' / '.join(blocked)} 浏览器指纹仍被拦截。"
-            "请在浏览器中打开该地址完成验证后重试，或改用直链。"
+            + CF_BLOCKED_HINT,
+            url,
         )
 
     def _download_urllib(self, url, headers, timeout):
@@ -603,7 +617,8 @@ class Downloader:
             if is_cloudflare_challenge(exc.code, exc.headers, body):
                 raise CloudflareBlocked(
                     "下载失败: 目标站点启用了 Cloudflare 人机验证，"
-                    "自动绕过不可用。请安装 curl_cffi 或在浏览器中完成验证后重试。"
+                    "自动绕过不可用（未安装 curl_cffi）。" + CF_BLOCKED_HINT,
+                    url,
                 ) from exc
             raise RuntimeError(f"下载失败: HTTP {exc.code} {exc.reason}") from exc
         except (urllib.error.URLError, OSError) as exc:

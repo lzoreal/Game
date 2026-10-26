@@ -43,6 +43,7 @@ ApplicationWindow {
         messageDialog.heading = title
         messageDialog.body = text
         messageDialog.isError = error
+        messageDialog.link = ""
         messageDialog.open()
     }
 
@@ -248,10 +249,11 @@ ApplicationWindow {
             toast.opacity = 1
             toastTimer.restart()
         }
-        function onMessageRequested(title, text, error) {
+        function onMessageRequested(title, text, error, link) {
             messageDialog.heading = title
             messageDialog.body = text
             messageDialog.isError = error
+            messageDialog.link = link || ""
             messageDialog.open()
         }
         function onOverwriteRequested(name) {
@@ -516,9 +518,11 @@ ApplicationWindow {
 
     Dialog {
         id: messageDialog
+        objectName: "messageDialog"
         property string heading: ""
         property string body: ""
         property bool isError: false
+        property string link: ""
         parent: Overlay.overlay
         x: Math.round((parent.width - width) / 2)
         y: Math.round((parent.height - height) / 2)
@@ -560,6 +564,7 @@ ApplicationWindow {
                 TextArea {
                     width: messageScroll.availableWidth
                     readOnly: true
+                    selectByMouse: true
                     text: messageDialog.body
                     color: theme.colors.muted
                     font.pixelSize: 11
@@ -570,6 +575,12 @@ ApplicationWindow {
             RowLayout {
                 Layout.fillWidth: true
                 Item { Layout.fillWidth: true }
+                AppButton {
+                    objectName: "messageOpenLink"
+                    visible: messageDialog.link.length > 0
+                    text: "用浏览器打开"
+                    onClicked: backend.open_external_url(messageDialog.link)
+                }
                 AppButton {
                     kind: "primary"
                     text: "确定"

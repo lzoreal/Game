@@ -161,6 +161,36 @@ class QmlUiTests(unittest.TestCase):
 
         self.assertEqual(calls, [("source", "change"), ("check", "outcome")])
 
+    def test_cloudflare_failure_passes_source_url_to_dialog(self):
+        messages = []
+        self.backend.messageRequested.connect(
+            lambda title, body, error, link: messages.append((title, body, link))
+        )
+        url = "https://hydralinks.cloud/sources/gog.json"
+        self.backend._download_url = url
+        self.backend.on_failed(
+            "fetch_add",
+            "gog.json: 下载失败: 目标站点启用了 Cloudflare 人机验证",
+        )
+        self.assertEqual(messages[-1][2], url)
+
+        self.backend.on_failed("fetch_add", "下载失败: HTTP 404 Not Found")
+        self.assertEqual(messages[-1][2], "")
+
+    def test_message_dialog_offers_browser_open(self):
+        url = "https://hydralinks.cloud/sources/gog.json"
+        self.backend.show_message("操作失败", "下载失败: Cloudflare 人机验证", True, url)
+        self.app.processEvents()
+        dialog = self.window.findChild(QObject, "messageDialog")
+        button = self.window.findChild(QObject, "messageOpenLink")
+        self.assertIsNotNone(dialog)
+        self.assertIsNotNone(button)
+        self.assertTrue(dialog.property("visible"))
+        self.assertEqual(dialog.property("link"), url)
+        self.assertEqual(button.property("text"), "用浏览器打开")
+        self.assertTrue(button.property("visible"))
+        dialog.close()
+
     def palette_color(self, menu, role):
         expr = QQmlExpression(self.engine.rootContext(), menu, "palette." + role)
         value, undefined = expr.evaluate()
