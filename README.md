@@ -54,14 +54,14 @@
 
 部分源站点启用了 Cloudflare。应用会先带浏览器风格请求头与三种浏览器指纹（Chrome / Safari / Firefox）直接请求；仍被拦截时，使用内嵌的 [chaser-cf](https://crates.io/crates/chaser-cf) 自动验证：
 
-- 自动启动本机 Chrome 或 Edge（有可见窗口）完成托管质询，验证通过后直接由浏览器读取源 JSON，避免 HTTP 客户端与浏览器指纹不一致导致二次拦截。
+- 自动启动本机 Chrome 或 Edge（默认移到屏幕外后台运行）完成托管质询，验证通过后直接由浏览器读取源 JSON，避免 HTTP 客户端与浏览器指纹不一致导致二次拦截。
 - 无感质询直接通过；需要点击的 Turnstile 会通过 CDP 穿透 shadow root / iframe 自动点击。
 - 验证并读取完成后自动关闭验证浏览器窗口；同一 profile 会复用已有 clearance，下次只需重新打开浏览器。
 - 每次启动验证浏览器时使用独立的临时浏览器 profile，退出时尝试清理，并在下次启动时清理过期目录；避免残留进程占用固定目录导致初始化失败。
 - 浏览器首次遇到验证时才启动，不会拖慢应用启动；多个源共享同一浏览器实例。
 - 单次验证可能需要 30–90 秒；默认超时 120 秒，可用 `CHASER_TIMEOUT`（毫秒）调整。
 - 需要本机安装 Chrome 或 Edge（Windows 会自动探测，Edge 回退可用）；可用 `CHROME_BIN` 指定浏览器路径，`CHASER_EXTRA_ARGS` 追加 Chrome 参数。
-- 托管质询在无头模式下通常无法通过，因此默认使用可见窗口（`CHASER_HEADLESS` 仅建议用于 Turnstile 场景）。
+- 托管质询在无头模式下不稳定，因此使用有头浏览器并默认移到屏幕外（不占用桌面）；调试时可设置 `GAMEMAGNET_CHASER_VISIBLE=1` 让窗口可见。任务栏可能短暂出现 Edge 图标。
 - 如需完全关闭自动验证，设置环境变量 `GAMEMAGNET_CHASER=0`。
 - 并发上限默认 4 个浏览器上下文，可用 `CHASER_CONTEXT_LIMIT` 调整。
 

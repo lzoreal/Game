@@ -11,6 +11,10 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_CONTEXT_LIMIT: usize = 4;
 const PROFILE_PREFIX: &str = "gamemagnet-chaser-";
 const STALE_PROFILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const HIDDEN_WINDOW_ARGS: [&str; 2] = [
+    "--window-position=-32000,-32000",
+    "--window-size=1280,800",
+];
 
 /// Seam so source downloads can be tested without launching a browser.
 pub trait CloudflareSolver: Send + Sync {
@@ -132,10 +136,33 @@ fn cleanup_stale_profiles() {
     }
 }
 
+fn hidden_window_args(visible: bool) -> &'static [&'static str] {
+    if visible {
+        &[]
+    } else {
+        &HIDDEN_WINDOW_ARGS
+    }
+}
+
+fn chaser_visible() -> bool {
+    match std::env::var("GAMEMAGNET_CHASER_VISIBLE") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 fn solver_config(user_data_dir: PathBuf) -> ChaserConfig {
     let mut config = ChaserConfig::from_env()
         .with_lazy_init(true)
         .with_user_data_dir(user_data_dir);
+    config.extra_args.extend(
+        hidden_window_args(chaser_visible())
+            .iter()
+            .map(|arg| arg.to_string()),
+    );
     if std::env::var_os("CHASER_TIMEOUT").is_none() {
         config.timeout_ms = DEFAULT_TIMEOUT_MS;
     }
@@ -201,6 +228,14 @@ mod tests {
         let config = solver_config(dir.clone());
         assert_eq!(config.user_data_dir.as_deref(), Some(dir.as_path()));
         assert!(config.lazy_init);
+    }
+
+    #[test]
+    fn window_is_off_screen_unless_visibility_requested() {
+        assert!(hidden_window_args(false)
+            .iter()
+            .any(|arg| arg.contains("window-position=-32000")));
+        assert!(hidden_window_args(true).is_empty());
     }
 
     #[test]

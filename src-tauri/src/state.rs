@@ -24,7 +24,7 @@ use crate::swarm;
 use crate::update::{self, UpdateResult};
 use crate::user::{UserState, UserStore};
 
-pub const APP_VERSION: &str = "v1.5.0";
+pub const APP_VERSION: &str = "v1.5.1";
 const DEBOUNCE_MS: u64 = 250;
 const RAW_LIMIT: usize = 100_000;
 /// Auto refresh waits long enough for the first load and the user's first
