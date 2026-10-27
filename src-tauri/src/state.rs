@@ -18,14 +18,19 @@ use crate::detail::{build_detail, DetailCard};
 use crate::model::{Group, Item, Row, SourceMeta, SourceRow};
 use crate::net::Downloader;
 use crate::platform::Platform;
-use crate::search::sort_by_date;
+use crate::search::{parse_query, sort_by_date};
 use crate::storage;
 use crate::swarm;
 use crate::update::{self, UpdateResult};
+use crate::user::{UserState, UserStore};
 
-pub const APP_VERSION: &str = "v1.4.0";
+pub const APP_VERSION: &str = "v1.5.0";
 const DEBOUNCE_MS: u64 = 250;
 const RAW_LIMIT: usize = 100_000;
+/// Auto refresh waits long enough for the first load and the user's first
+/// click to finish, then only touches sources that have gone stale.
+const AUTO_REFRESH_DELAY: Duration = Duration::from_secs(60);
+const AUTO_REFRESH_STALE_SECS: i64 = 24 * 60 * 60;
 
 pub type Emitter = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
@@ -39,6 +44,71 @@ pub struct BtCatalogRow {
     pub desc: &'static str,
     pub url: &'static str,
     pub recommended: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    All,
+    Favorites,
+    Unhandled,
+}
+
+impl View {
+    fn parse(value: &str) -> Self {
+        match value {
+            "favorites" => Self::Favorites,
+            "unhandled" => Self::Unhandled,
+            _ => Self::All,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Favorites => "favorites",
+            Self::Unhandled => "unhandled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortMode {
+    FavoriteDesc,
+    DateDesc,
+    DateAsc,
+    TitleAsc,
+}
+
+impl SortMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FavoriteDesc => "favoriteDesc",
+            Self::DateDesc => "dateDesc",
+            Self::DateAsc => "dateAsc",
+            Self::TitleAsc => "titleAsc",
+        }
+    }
+
+    /// The button cycles through the date and title orders; the favorites
+    /// order is the entry point of the favorites view, not part of the cycle.
+    fn next(self) -> Self {
+        match self {
+            Self::FavoriteDesc => Self::DateDesc,
+            Self::DateDesc => Self::DateAsc,
+            Self::DateAsc => Self::TitleAsc,
+            Self::TitleAsc => Self::DateDesc,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareRow {
+    pub source: String,
+    pub size: String,
+    pub date: String,
+    /// True for the entry the favorite remembers.
+    pub chosen: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -61,7 +131,15 @@ pub struct Snapshot {
     pub active_source: String,
     pub active_source_display: String,
     pub active_source_url: String,
-    pub sort_desc: bool,
+    pub sort_mode: &'static str,
+    pub view: &'static str,
+    pub show_handled: bool,
+    pub blocked: Vec<String>,
+    pub block_enabled: bool,
+    pub favorite_count: usize,
+    pub handled_count: usize,
+    pub total_groups: usize,
+    pub user_state_path: String,
     #[serde(rename = "selectedResultIndex")]
     pub selected_index: i64,
     pub has_detail: bool,
@@ -73,24 +151,34 @@ pub struct Snapshot {
 #[derive(Clone, Debug, Serialize)]
 pub struct DetailPayload {
     pub title: String,
+    pub key: String,
     pub sources: Vec<String>,
     pub meta: String,
     pub hint: String,
     pub cards: Vec<DetailCard>,
     pub raw: String,
     pub has: bool,
+    pub favorite: bool,
+    pub handled: bool,
+    pub broken: bool,
+    pub compare: Vec<CompareRow>,
 }
 
 impl Default for DetailPayload {
     fn default() -> Self {
         Self {
             title: String::new(),
+            key: String::new(),
             sources: Vec::new(),
             meta: String::new(),
             hint: String::new(),
             cards: Vec::new(),
             raw: String::new(),
             has: false,
+            favorite: false,
+            handled: false,
+            broken: false,
+            compare: Vec::new(),
         }
     }
 }
@@ -103,7 +191,10 @@ struct Inner {
     fuzzy: bool,
     threshold: f64,
     active_source: String,
-    sort_desc: bool,
+    sort_mode: SortMode,
+    view: View,
+    show_handled: bool,
+    user: UserState,
     selected_index: Option<usize>,
     groups: Vec<Group>,
     status: String,
@@ -131,6 +222,7 @@ pub struct AppState {
     commands: SourceCommands,
     platform: Arc<dyn Platform>,
     emitter: Emitter,
+    user_store: UserStore,
 }
 
 fn group_digits(value: usize) -> String {
@@ -178,17 +270,121 @@ fn scope_text(inner: &Inner) -> String {
         .unwrap_or_else(|| "全部游戏".to_string())
 }
 
-fn build_detail_payload(group: &Group) -> DetailPayload {
+/// The link a favorite remembers: the newest item's first link, the same entry
+/// the detail pane shows first.
+fn remembered_uri_of(group: &Group) -> String {
+    group
+        .items
+        .iter()
+        .find_map(|item| item.uris.first().map(|uri| uri.to_string()))
+        .unwrap_or_default()
+}
+
+fn group_broken(group: &Group, user: &UserState) -> bool {
+    let Some(uri) = user.remembered_uri(&group.key) else {
+        return false;
+    };
+    !group.uris.iter().any(|candidate| candidate == uri)
+}
+
+fn env_flag_off(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Filters the view (`all` / `favorites` / `unhandled`) and the blocklist.
+/// Phrase/exclusion filtering is *not* done here: `search_items` already
+/// applies the grammar to each item's normalized title, and re-testing the
+/// group's `key` would drop valid hits because `key` has version numbers
+/// stripped (`"v1.1"` matched `alpha game v1 1`, but `alpha game` does not
+/// contain it). The latest list, which has no positive term, is filtered against
+/// `key` by `arrange_groups`.
+fn view_keeps(inner: &Inner, group: &Group) -> bool {
+    if inner.user.is_blocked(&group.key) {
+        return false;
+    }
+    let handled = inner.user.is_handled(&group.key);
+    match inner.view {
+        View::All => inner.show_handled || !handled,
+        View::Favorites => inner.user.is_favorite(&group.key) && (inner.show_handled || !handled),
+        View::Unhandled => !handled,
+    }
+}
+
+fn order_groups(groups: &mut Vec<Group>, mode: SortMode, user: &UserState) {
+    match mode {
+        SortMode::DateDesc | SortMode::DateAsc => {
+            let taken = std::mem::take(groups);
+            *groups = sort_by_date(taken, mode == SortMode::DateDesc);
+        }
+        SortMode::TitleAsc => {
+            groups.sort_by_cached_key(|group| group.title.to_lowercase());
+        }
+        SortMode::FavoriteDesc => {
+            groups.sort_by(|left, right| {
+                user.favorite_time(&right.key)
+                    .cmp(&user.favorite_time(&left.key))
+            });
+        }
+    }
+}
+
+fn arrange_groups(groups: Vec<Group>, inner: &Inner, filter_query: bool) -> Vec<Group> {
+    let parsed = parse_query(&inner.query);
+    let mut groups: Vec<Group> = groups
+        .into_iter()
+        .filter(|group| view_keeps(inner, group))
+        .filter(|group| !filter_query || parsed.matches(&group.key))
+        .collect();
+    order_groups(&mut groups, inner.sort_mode, &inner.user);
+    groups
+}
+
+/// True when the query has at least one positive term, so an in-flight latest
+/// list must not overwrite the search results. A query made only of
+/// `-exclusions` still uses the latest list as its base set.
+fn query_has_positive(query: &str) -> bool {
+    !query.is_empty() && parse_query(query).has_positive()
+}
+
+fn build_detail_payload(group: &Group, user: &UserState) -> DetailPayload {
     let expanded = HashSet::new();
     let model = build_detail(group, &expanded, false, 100_000, RAW_LIMIT);
+    let remembered = user.remembered_uri(&group.key);
+    let compare = group
+        .items
+        .iter()
+        .map(|item| CompareRow {
+            source: item.source_display.to_string(),
+            size: item.file_size.to_string(),
+            date: match item.date_dt {
+                Some(dt) => crate::dates::format_date(&dt),
+                None => item.upload_date.to_string(),
+            },
+            chosen: remembered
+                .map(|uri| item.uris.iter().any(|candidate| candidate.as_ref() == uri))
+                .unwrap_or(false),
+        })
+        .collect();
     DetailPayload {
         title: model.title,
+        key: group.key.clone(),
         sources: model.sources,
         meta: model.meta,
         hint: model.hint,
         cards: model.cards,
         raw: String::new(),
         has: true,
+        favorite: user.is_favorite(&group.key),
+        handled: user.is_handled(&group.key),
+        broken: group_broken(group, user),
+        compare,
     }
 }
 
@@ -357,6 +553,8 @@ impl AppState {
         let _ = std::fs::create_dir_all(&sources_dir);
         let commands = SourceCommands::new(sources_dir.clone(), Arc::clone(&downloader));
         let bt_targets = bt::detect(&SystemProbe);
+        let user_store = UserStore::new(&sources_dir);
+        let user = user_store.load();
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 items: Vec::new(),
@@ -366,7 +564,10 @@ impl AppState {
                 fuzzy: true,
                 threshold: 0.3,
                 active_source: String::new(),
-                sort_desc: true,
+                sort_mode: SortMode::DateDesc,
+                view: View::All,
+                show_handled: false,
+                user,
                 selected_index: None,
                 groups: Vec::new(),
                 status: "正在加载源…".to_string(),
@@ -391,6 +592,7 @@ impl AppState {
             commands,
             platform,
             emitter,
+            user_store,
         })
     }
 
@@ -476,7 +678,15 @@ impl AppState {
             active_source: inner.active_source.clone(),
             active_source_display: active_display,
             active_source_url: active_url,
-            sort_desc: inner.sort_desc,
+            sort_mode: inner.sort_mode.as_str(),
+            view: inner.view.as_str(),
+            show_handled: inner.show_handled,
+            blocked: inner.user.blocked.clone(),
+            block_enabled: inner.user.block_enabled,
+            favorite_count: inner.user.favorites.len(),
+            handled_count: inner.user.handled.len(),
+            total_groups: inner.group_keys.len(),
+            user_state_path: self.user_store.path().to_string_lossy().to_string(),
             selected_index: inner
                 .selected_index
                 .map(|index| index as i64)
@@ -506,7 +716,18 @@ impl AppState {
     }
 
     pub fn results_rows(&self) -> Vec<Row> {
-        self.lock().groups.iter().map(Group::row).collect()
+        let inner = self.lock();
+        inner
+            .groups
+            .iter()
+            .map(|group| {
+                group.row(
+                    inner.user.is_favorite(&group.key),
+                    inner.user.is_handled(&group.key),
+                    group_broken(group, &inner.user),
+                )
+            })
+            .collect()
     }
 
     pub fn detail_payload(&self) -> DetailPayload {
@@ -523,10 +744,7 @@ impl AppState {
     }
 
     fn emit_results(&self) {
-        let rows: Vec<Row> = {
-            let inner = self.lock();
-            inner.groups.iter().map(Group::row).collect()
-        };
+        let rows = self.results_rows();
         self.emit("results", serde_json::to_value(rows).unwrap_or(Value::Null));
     }
 
@@ -561,10 +779,13 @@ impl AppState {
             if let Some(count) = inner.active_counts.get_mut(kind) {
                 *count = count.saturating_sub(1);
             }
-            if inner.active_counts.get(kind).copied().unwrap_or(0) == 0 {
-                if inner.status.starts_with("正在") || kind == "load" {
-                    inner.status = ready_status(&inner);
-                }
+            // Progress lines such as "刷新源 (1/2): a.json" do not start with
+            // 正在, so the old heuristic left the status bar stuck whenever the
+            // last task ended without a reload (all sources answered 304).
+            let any_active = inner.active_counts.values().any(|count| *count > 0);
+            if !any_active && !inner.status.starts_with("正在搜索") {
+                let status = ready_status(&inner);
+                inner.status = status;
             }
         }
         self.emit_state();
@@ -578,6 +799,67 @@ impl AppState {
 
     pub fn start(self: &Arc<Self>) {
         self.refresh_bt_targets();
+        self.load_sources();
+        self.schedule_auto_refresh();
+    }
+
+    /// Background refresh, 60 seconds after startup.
+    ///
+    /// Only sources whose last successful fetch is more than a day old are
+    /// touched, and Cloudflare-protected sources are skipped: refreshing those
+    /// can open a browser window, which must never happen unprompted.
+    fn schedule_auto_refresh(self: &Arc<Self>) {
+        if env_flag_off("GAMEMAGNET_AUTO_REFRESH") {
+            return;
+        }
+        let delay = std::env::var("GAMEMAGNET_AUTO_REFRESH_DELAY_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(AUTO_REFRESH_DELAY);
+        let state = Arc::clone(self);
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            state.auto_refresh();
+        });
+    }
+
+    pub fn auto_refresh(self: &Arc<Self>) {
+        if self.active_tasks("load") > 0
+            || self.active_tasks("refresh") > 0
+            || self.active_tasks("update") > 0
+        {
+            return;
+        }
+        let names = self.commands.stale_targets(AUTO_REFRESH_STALE_SECS);
+        if names.is_empty() {
+            return;
+        }
+        self.set_status(format!("自动刷新 {} 个过期源…", names.len()));
+        self.begin_task("refresh");
+        let state = Arc::clone(self);
+        std::thread::spawn(move || {
+            let progress_state = Arc::clone(&state);
+            let mut report = move |index: usize, total: usize, name: &str| {
+                progress_state.set_status(format!("自动刷新 ({index}/{total}): {name}"));
+            };
+            let result = state.commands.refresh_passive(Some(&names), &mut report);
+            state.on_auto_refreshed(result);
+        });
+    }
+
+    /// Auto refresh never opens a dialog: the user did not ask for it, so it
+    /// reports through the status bar and a toast only when something changed.
+    fn on_auto_refreshed(self: &Arc<Self>, result: crate::commands::RefreshResult) {
+        // `end_task` clears the "自动刷新 (i/n)" progress line and emits state.
+        self.end_task("refresh");
+        if result.updated.is_empty() {
+            if !result.failed.is_empty() {
+                self.toast(&format!("自动刷新：{} 个源失败", result.failed.len()));
+            }
+            return;
+        }
+        self.toast(&format!("自动刷新：更新了 {} 个源", result.updated.len()));
         self.load_sources();
     }
 
@@ -732,6 +1014,14 @@ impl AppState {
 
         inner.latest_wanted = None;
         inner.latest_loading = false;
+        let parsed = parse_query(&query);
+        if !parsed.has_positive() {
+            // `-合集` alone: there is nothing to score, so the latest list is
+            // the base set and `arrange_groups` drops the exclusions.
+            drop(inner);
+            self.run_latest();
+            return;
+        }
         let filter = if inner.active_source.is_empty() {
             String::new()
         } else {
@@ -739,24 +1029,29 @@ impl AppState {
         };
         let (groups, total) = search_items(
             &inner.items,
-            &query,
+            &parsed,
             inner.fuzzy,
             inner.threshold,
             &filter,
             MAX_RESULTS,
         );
-        let groups = sort_by_date(groups, inner.sort_desc);
+        let groups = arrange_groups(groups, &inner, false);
+        let shown = groups.len();
         let elapsed = started.elapsed().as_secs_f64();
         inner.groups = groups;
         inner.detail_raw = None;
-        inner.count_text = format!("找到 {} 组", group_digits(total));
+        inner.count_text = if shown == total {
+            format!("找到 {} 组", group_digits(shown))
+        } else {
+            format!("找到 {} 组 · 共 {} 组", group_digits(shown), group_digits(total))
+        };
         inner.elapsed_text = format!("{elapsed:.2} 秒");
         if inner.groups.is_empty() {
             inner.selected_index = None;
             inner.detail = DetailPayload::default();
         } else {
             inner.selected_index = Some(0);
-            inner.detail = build_detail_payload(&inner.groups[0]);
+            inner.detail = build_detail_payload(&inner.groups[0], &inner.user);
         }
         inner.status = ready_status(&inner);
         drop(inner);
@@ -810,20 +1105,143 @@ impl AppState {
 
     pub fn toggle_sort(&self) {
         let mut inner = self.lock();
-        inner.sort_desc = !inner.sort_desc;
-        let desc = inner.sort_desc;
-        let mut groups = std::mem::take(&mut inner.groups);
-        groups = sort_by_date(groups, desc);
-        inner.groups = groups;
-        inner.detail_raw = None;
-        if inner.selected_index.is_some() && !inner.groups.is_empty() {
-            inner.selected_index = Some(0);
-            inner.detail = build_detail_payload(&inner.groups[0]);
+        inner.sort_mode = inner.sort_mode.next();
+        let Inner {
+            groups,
+            sort_mode,
+            user,
+            detail,
+            selected_index,
+            detail_raw,
+            ..
+        } = &mut *inner;
+        order_groups(groups, *sort_mode, user);
+        *detail_raw = None;
+        if selected_index.is_some() && !groups.is_empty() {
+            *selected_index = Some(0);
+            *detail = build_detail_payload(&groups[0], user);
         }
         drop(inner);
         self.emit_state();
         self.emit_results();
         self.emit_detail();
+    }
+
+    // ---------------------------------------------------------- user state
+
+    fn refresh_current(self: &Arc<Self>) {
+        if !self.lock().query.is_empty() {
+            self.run_search_now();
+        } else {
+            self.run_latest();
+        }
+    }
+
+    /// Writes the current user state while holding the state lock, so two quick
+    /// toggles cannot persist out of order (the second clone used to be able to
+    /// land on disk before the first and lose the newer change).
+    fn persist_user(&self) {
+        let error = {
+            let inner = self.lock();
+            self.user_store.save(&inner.user).err()
+        };
+        if let Some(error) = error {
+            log::warn!("保存用户状态失败: {error}");
+            self.toast(&format!("保存用户状态失败: {error}"));
+        }
+    }
+
+    pub fn set_view(self: &Arc<Self>, view: &str) {
+        let next = View::parse(view);
+        {
+            let mut inner = self.lock();
+            if inner.view == next {
+                return;
+            }
+            inner.view = next;
+            inner.sort_mode = match next {
+                View::Favorites => SortMode::FavoriteDesc,
+                _ if inner.sort_mode == SortMode::FavoriteDesc => SortMode::DateDesc,
+                _ => inner.sort_mode,
+            };
+        }
+        self.emit_state();
+        self.refresh_current();
+    }
+
+    pub fn set_show_handled(self: &Arc<Self>, enabled: bool) {
+        {
+            let mut inner = self.lock();
+            if inner.show_handled == enabled {
+                return;
+            }
+            inner.show_handled = enabled;
+        }
+        self.emit_state();
+        self.refresh_current();
+    }
+
+    pub fn toggle_favorite(self: &Arc<Self>, key: &str) {
+        let now = chrono::Utc::now().timestamp();
+        let favorite_view = {
+            let mut inner = self.lock();
+            let uri = inner
+                .groups
+                .iter()
+                .find(|group| group.key == key)
+                .map(remembered_uri_of)
+                .unwrap_or_default();
+            inner.user.toggle_favorite(key, &uri, now);
+            if inner.detail.has && inner.detail.key == key {
+                if let Some(group) = inner.groups.iter().find(|group| group.key == key) {
+                    inner.detail = build_detail_payload(group, &inner.user);
+                }
+            }
+            inner.view == View::Favorites
+        };
+        self.persist_user();
+        if favorite_view {
+            // Un-favoriting removes the row from this very view.
+            self.refresh_current();
+        } else {
+            self.emit_state();
+            self.emit_results();
+            self.emit_detail();
+        }
+    }
+
+    pub fn toggle_handled(self: &Arc<Self>, key: &str) {
+        {
+            let mut inner = self.lock();
+            inner.user.toggle_handled(key);
+        }
+        self.persist_user();
+        self.refresh_current();
+    }
+
+    /// Replaces the whole list. Adding a term turns filtering back on, so the
+    /// user sees the effect of what they just typed.
+    pub fn set_blocklist(self: &Arc<Self>, terms: Vec<String>) {
+        {
+            let mut inner = self.lock();
+            inner.user.set_blocked(terms);
+        }
+        self.persist_user();
+        self.emit_state();
+        self.refresh_current();
+    }
+
+    pub fn set_block_enabled(self: &Arc<Self>, enabled: bool) {
+        {
+            let mut inner = self.lock();
+            if inner.user.block_enabled == enabled {
+                return;
+            }
+            inner.user.set_block_enabled(enabled);
+        }
+        self.persist_user();
+        self.emit_state();
+        self.refresh_current();
     }
 
     // -------------------------------------------------------------- latest
@@ -911,7 +1329,9 @@ impl AppState {
             }
             inner.latest_inflight.remove(&cache_key);
             inner.latest_cache.insert(cache_key.clone(), (groups.clone(), total));
-            if !inner.query.is_empty() || inner.latest_wanted.as_deref() != Some(cache_key.as_str()) {
+            if query_has_positive(&inner.query)
+                || inner.latest_wanted.as_deref() != Some(cache_key.as_str())
+            {
                 inner.latest_loading = false;
                 drop(inner);
                 self.emit_state();
@@ -928,6 +1348,7 @@ impl AppState {
     fn apply_latest(&self, groups: Vec<Group>, total: usize) {
         {
             let mut inner = self.lock();
+            let groups = arrange_groups(groups, &inner, true);
             let shown = groups.len();
             inner.groups = groups;
             inner.detail_raw = None;
@@ -976,7 +1397,7 @@ impl AppState {
                 inner
                     .groups
                     .get(value)
-                    .map(|group| (value, build_detail_payload(group)))
+                    .map(|group| (value, build_detail_payload(group, &inner.user)))
             });
             match payload {
                 Some((position, payload)) => {
@@ -1210,12 +1631,23 @@ impl AppState {
         });
     }
 
-    fn on_updated(self: &Arc<Self>, outcome: Result<crate::commands::SourceChange, CommandError>) {
+    fn on_updated(
+        self: &Arc<Self>,
+        outcome: Result<Option<crate::commands::SourceChange>, CommandError>,
+    ) {
         self.end_task("update");
         match outcome {
-            Ok(change) => {
+            Ok(Some(change)) => {
                 self.toast(&format!("已更新 {}", change.name));
                 self.load_sources();
+            }
+            Ok(None) => {
+                {
+                    let mut inner = self.lock();
+                    inner.status = ready_status(&inner);
+                }
+                self.emit_state();
+                self.toast("已是最新，无需更新");
             }
             Err(error) => {
                 {
@@ -1305,6 +1737,12 @@ impl AppState {
     }
 
     pub fn refresh_all(self: &Arc<Self>) {
+        if self.active_tasks("refresh") > 0 {
+            // Clicking refresh twice used to start two passes over the same
+            // files; the second one could race the first one's temp file.
+            self.toast("正在刷新，请稍候");
+            return;
+        }
         let count = {
             let inner = self.lock();
             inner
@@ -1333,8 +1771,9 @@ impl AppState {
     fn on_refreshed(self: &Arc<Self>, result: crate::commands::RefreshResult) {
         self.end_task("refresh");
         let mut lines = vec![format!(
-            "成功更新 {} 个源，失败 {} 个",
+            "成功更新 {} 个源，无变化 {} 个，失败 {} 个",
             result.updated.len(),
+            result.unchanged.len(),
             result.failed.len()
         )];
         lines.extend(
@@ -1365,7 +1804,13 @@ impl AppState {
             String::new()
         };
         self.show_message("刷新完成", &lines.join("\n"), false, &link);
-        self.load_sources();
+        if result.updated.is_empty() {
+            // Nothing was rewritten: reloading 200k entries would only make
+            // the UI blink for no reason.
+            self.emit_state();
+        } else {
+            self.load_sources();
+        }
     }
 
     // -------------------------------------------------------------- update
@@ -2011,11 +2456,335 @@ mod tests {
         if let Some(digest) = result.release.download_digest.as_deref() {
             assert!(crate::update::verify_sha256(&bytes, digest));
         }
-        eprintln!(
-            "downloaded {} bytes from {} (digest={:?})",
-            bytes.len(),
-            url,
-            result.release.download_digest
+    }
+
+    #[test]
+    fn favorites_anchor_on_the_normalized_title_and_survive_reload() {
+        let dir = temp_dir("favorites");
+        write_catalog(&dir, true);
+        let state = state_for(&dir);
+        load_and_wait(&state);
+
+        let alpha = state
+            .results_rows()
+            .into_iter()
+            .find(|row| row.title.starts_with("Alpha"))
+            .expect("alpha group");
+        assert_eq!(alpha.key, "alpha game");
+
+        state.toggle_favorite(&alpha.key);
+        assert_eq!(state.snapshot().favorite_count, 1);
+        let marked = state
+            .results_rows()
+            .into_iter()
+            .find(|row| row.key == "alpha game")
+            .unwrap();
+        assert!(marked.favorite);
+        assert!(!marked.broken);
+
+        // A fresh process must read the same favorite back from disk.
+        let reloaded = state_for(&dir);
+        load_and_wait(&reloaded);
+        let again = reloaded
+            .results_rows()
+            .into_iter()
+            .find(|row| row.key == "alpha game")
+            .expect("favorite survives reload");
+        assert!(again.favorite);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn handled_groups_leave_the_list_and_come_back_when_asked() {
+        let dir = temp_dir("handled");
+        write_catalog(&dir, true);
+        let state = state_for(&dir);
+        load_and_wait(&state);
+        assert_eq!(state.results_rows().len(), 2);
+
+        let beta = state
+            .results_rows()
+            .into_iter()
+            .find(|row| row.key == "beta")
+            .unwrap();
+        state.toggle_handled(&beta.key);
+        assert!(wait_until(|| state.results_rows().len() == 1, 5000));
+        assert_eq!(state.snapshot().handled_count, 1);
+
+        state.set_show_handled(true);
+        assert!(wait_until(|| state.results_rows().len() == 2, 5000));
+
+        state.set_view("unhandled");
+        assert!(wait_until(|| state.results_rows().len() == 1, 5000));
+        assert_eq!(state.snapshot().view, "unhandled");
+
+        state.set_view("favorites");
+        assert!(wait_until(|| state.results_rows().is_empty(), 5000));
+        assert_eq!(state.snapshot().sort_mode, "favoriteDesc");
+
+        state.set_view("all");
+        assert!(wait_until(|| state.results_rows().len() == 2, 5000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_favorite_reports_a_broken_link_when_its_item_disappears() {
+        let dir = temp_dir("broken");
+        write_catalog(&dir, true);
+        let state = state_for(&dir);
+        load_and_wait(&state);
+
+        state.toggle_favorite("alpha game");
+        assert!(!state
+            .results_rows()
+            .into_iter()
+            .find(|row| row.key == "alpha game")
+            .unwrap()
+            .broken);
+
+        // The newest item (`magnet:b`, the one the favorite remembered) is gone.
+        write_catalog(&dir, false);
+        state.load_sources();
+        load_and_wait(&state);
+
+        let row = state
+            .results_rows()
+            .into_iter()
+            .find(|row| row.key == "alpha game")
+            .expect("group survives");
+        assert!(row.favorite);
+        assert!(row.broken);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detail_compares_sources_and_marks_the_remembered_one() {
+        let dir = temp_dir("compare");
+        write_catalog(&dir, true);
+        let state = state_for(&dir);
+        load_and_wait(&state);
+
+        state.select_result(0);
+        assert_eq!(state.detail_payload().key, "alpha game");
+        state.toggle_favorite("alpha game");
+        let detail = state.detail_payload();
+        assert!(detail.favorite);
+        assert!(!detail.broken);
+        assert_eq!(detail.compare.len(), 2);
+        assert_eq!(
+            detail.compare.iter().filter(|row| row.chosen).count(),
+            1,
+            "exactly the remembered item is marked"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn blocklist_hides_groups_and_turning_it_off_brings_them_back() {
+        let dir = temp_dir("blocklist-view");
+        write_catalog(&dir, true);
+        let state = state_for(&dir);
+        load_and_wait(&state);
+        assert_eq!(state.results_rows().len(), 2);
+
+        state.set_blocklist(vec![" Beta ".to_string(), "beta".to_string()]);
+        assert!(wait_until(|| state.results_rows().len() == 1, 5000));
+        assert_eq!(state.results_rows()[0].key, "alpha game");
+        assert_eq!(state.snapshot().blocked, vec!["beta"]);
+        assert!(state.snapshot().block_enabled);
+
+        state.set_block_enabled(false);
+        assert!(wait_until(|| state.results_rows().len() == 2, 5000));
+        assert!(!state.snapshot().block_enabled);
+        assert_eq!(
+            state.snapshot().blocked,
+            vec!["beta"],
+            "switching it off must not delete the list"
+        );
+
+        // The choice survives a restart.
+        let reloaded = state_for(&dir);
+        load_and_wait(&reloaded);
+        assert_eq!(reloaded.snapshot().blocked, vec!["beta"]);
+        assert!(!reloaded.snapshot().block_enabled);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn phrases_and_exclusions_filter_search_results() {
+        let dir = temp_dir("phrase-search");
+        write_catalog(&dir, true);
+        let state = state_for(&dir);
+        load_and_wait(&state);
+
+        state.set_query(r#""alpha game""#);
+        assert!(wait_until(|| state.results_rows().len() == 1, 5000));
+        assert_eq!(state.results_rows()[0].key, "alpha game");
+
+        // Both versions carry "v1" in the normalized title, so the exclusion
+        // empties the result set instead of just lowering the score.
+        state.set_query(r#""alpha game" -v1"#);
+        assert!(wait_until(|| state.results_rows().is_empty(), 5000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_phrase_with_a_version_number_keeps_the_hit() {
+        let dir = temp_dir("phrase-version");
+        write_catalog(&dir, true);
+        let state = state_for(&dir);
+        load_and_wait(&state);
+
+        // `search_items` matches the item's normalized title ("alpha game v1
+        // 1"), but the group key has the version stripped ("alpha game"). The
+        // arrange step must not re-test the phrase against the key and drop a
+        // row the search already accepted.
+        state.set_query(r#""alpha game v1.1""#);
+        assert!(wait_until(|| state.results_rows().len() == 1, 5000));
+        let rows = state.results_rows();
+        assert_eq!(rows[0].key, "alpha game");
+        assert!(state.snapshot().count_text.contains("找到 1 组"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_query_of_only_exclusions_filters_the_latest_list() {
+        let dir = temp_dir("only-exclusions");
+        write_catalog(&dir, true);
+        let state = state_for(&dir);
+        load_and_wait(&state);
+        assert_eq!(state.results_rows().len(), 2);
+
+        state.set_query("-alpha");
+        assert!(wait_until(|| state.results_rows().len() == 1, 5000));
+        assert_eq!(state.results_rows()[0].key, "beta");
+
+        state.set_query("-beta");
+        assert!(wait_until(|| {
+            let rows = state.results_rows();
+            rows.len() == 1 && rows[0].key == "alpha game"
+        }, 5000));
+
+        state.set_query("");
+        assert!(wait_until(|| state.results_rows().len() == 2, 5000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finishing_a_task_clears_the_progress_line_even_without_a_reload() {
+        let dir = temp_dir("refresh-status");
+        write_catalog(&dir, true);
+        let state = state_for(&dir);
+        load_and_wait(&state);
+        let ready = state.snapshot().status;
+
+        state.begin_task("refresh");
+        state.set_status("刷新源 (1/1): demo.json.gz");
+        state.end_task("refresh");
+
+        let status = state.snapshot().status;
+        assert_eq!(status, ready, "an all-304 refresh must not leave progress text");
+        assert!(!status.contains("刷新源"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn auto_refresh_touches_only_stale_sources_and_shows_no_dialog() {
+        use crate::storage::{FileStateStore, StateStore as _};
+
+        let dir = temp_dir("auto-refresh");
+        write_catalog(&dir, true);
+        storage::write_url_file(
+            &dir.join("demo.json.gz"),
+            "https://example.com/demo.json",
+        )
+        .unwrap();
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&events);
+        let emitter: Emitter =
+            Arc::new(move |event, _| seen.lock().unwrap().push(event.to_string()));
+        let state = AppState::new(
+            dir.clone(),
+            Arc::new(Downloader::new(Arc::new(OfflineClient))),
+            Arc::new(FakePlatform),
+            emitter,
+        );
+        load_and_wait(&state);
+
+        // Freshly fetched: the background pass must not touch it.
+        let store = FileStateStore::new(&dir);
+        store.record_success("demo.json.gz", "h", None, None, false);
+        state.auto_refresh();
+        assert_eq!(state.active_tasks("refresh"), 0);
+        assert!(!events.lock().unwrap().iter().any(|event| event == "toast"));
+
+        // Three days later it is worth a try, but the passive pass cannot
+        // reach the network here, so it must fail quietly.
+        let mut snap = store.load().unwrap();
+        snap.source_snapshots
+            .get_mut("demo.json.gz")
+            .unwrap()
+            .last_success = Some(chrono::Utc::now() - chrono::Duration::days(3));
+        store.save(&snap).unwrap();
+
+        state.auto_refresh();
+        assert!(wait_until(|| state.active_tasks("refresh") == 0, 5000));
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event == "toast"),
+            "the user still gets a quiet failure notice"
+        );
+        assert!(
+            !events.iter().any(|event| event == "message"),
+            "auto refresh must never open a modal"
+        );
+        drop(events);
+        assert_eq!(store.snapshot("demo.json.gz").consecutive_failures, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gamemagnet-user-state-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn state_for(dir: &Path) -> Arc<AppState> {
+        let emitter: Emitter = Arc::new(|_, _| {});
+        AppState::new(
+            dir.to_path_buf(),
+            Arc::new(Downloader::new(Arc::new(OfflineClient))),
+            Arc::new(FakePlatform),
+            emitter,
+        )
+    }
+
+    fn load_and_wait(state: &Arc<AppState>) {
+        state.load_sources();
+        assert!(wait_until(
+            || state.active_tasks("load") == 0 && !state.results_rows().is_empty(),
+            5000
+        ));
+    }
+
+    /// Two sources of the same game (`magnet:a` older, `magnet:b` newer) plus an
+    /// unrelated one. `with_newest` drops `magnet:b` to simulate a dead link.
+    fn write_catalog(dir: &Path, with_newest: bool) {
+        let mut rows = vec![
+            json!({"title": "Alpha Game v1.0", "uris": ["magnet:a"], "fileSize": "1 GB", "uploadDate": "2024-01-01"}),
+        ];
+        if with_newest {
+            rows.push(json!({"title": "Alpha Game v1.1", "uris": ["magnet:b"], "fileSize": "2 GB", "uploadDate": "2024-02-01"}));
+        }
+        rows.push(json!({"title": "Beta", "uris": ["magnet:c"], "fileSize": "3 GB", "uploadDate": "2023-01-01"}));
+        storage::write_source_file(&dir.join("demo.json.gz"), &json!({ "repacks": rows })).unwrap();
     }
 }

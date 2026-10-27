@@ -96,6 +96,19 @@ fn finish(response: HttpResponse) -> Result<String, NetError> {
         .map_err(|error| NetError::plain(format!("下载失败: 响应内容无效: {error}")))
 }
 
+/// Like [`finish`], but keeps the validators before the body is moved out.
+fn finish_meta(response: HttpResponse) -> Result<Downloaded, NetError> {
+    let etag = response.header("etag").map(str::to_string);
+    let last_modified = response.header("last-modified").map(str::to_string);
+    let body = finish(response)?;
+    Ok(Downloaded {
+        body,
+        etag,
+        last_modified,
+        via_cloudflare: false,
+    })
+}
+
 pub fn is_cloudflare_challenge(status: u16, headers: &HashMap<String, String>, body: &[u8]) -> bool {
     if !CF_STATUS_CODES.contains(&status) {
         return false;
@@ -145,6 +158,25 @@ pub struct Downloader {
     solver: Option<Arc<dyn CloudflareSolver>>,
 }
 
+/// A downloaded body together with the validators that make the *next* fetch
+/// cheap. Responses obtained through the Cloudflare browser channel carry no
+/// usable validators (`None`, `None`), so callers fall back to hashing.
+#[derive(Clone, Debug, Default)]
+pub struct Downloaded {
+    pub body: String,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub via_cloudflare: bool,
+}
+
+/// Outcome of a conditional fetch.
+#[derive(Clone, Debug)]
+pub enum FetchOutcome {
+    /// `304`: the stored copy is still current. No body was transferred.
+    NotModified,
+    Fetched(Downloaded),
+}
+
 impl Downloader {
     pub fn new(client: Arc<dyn HttpClient>) -> Self {
         Self {
@@ -164,7 +196,90 @@ impl Downloader {
     }
 
     pub fn download_json(&self, url: &str) -> Result<String, NetError> {
-        let headers = request_headers(url);
+        self.download_json_with_meta(url).map(|fetched| fetched.body)
+    }
+
+    pub fn download_json_with_meta(&self, url: &str) -> Result<Downloaded, NetError> {
+        self.download_json_with_meta_opts(url, true)
+    }
+
+    /// Downloads without ever starting the browser channel. Background refresh
+    /// uses this: opening a Chrome window is only acceptable when the user
+    /// asked for the fetch.
+    pub fn download_json_with_meta_no_solver(&self, url: &str) -> Result<Downloaded, NetError> {
+        self.download_json_with_meta_opts(url, false)
+    }
+
+    fn download_json_with_meta_opts(
+        &self,
+        url: &str,
+        use_solver: bool,
+    ) -> Result<Downloaded, NetError> {
+        match self.fetch(url, &[], use_solver)? {
+            FetchOutcome::Fetched(fetched) => Ok(fetched),
+            // Only reachable if a server volunteers a 304 for a request that
+            // carried no validators; retry like an ordinary download.
+            FetchOutcome::NotModified => Err(NetError::plain(
+                "下载失败: 服务器返回 304，但没有可用的缓存副本，请重试",
+            )),
+        }
+    }
+
+    /// Conditional GET: sends `If-None-Match` / `If-Modified-Since` when the
+    /// caller has them. A server that ignores them simply answers `200`.
+    pub fn conditional_json(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<FetchOutcome, NetError> {
+        self.conditional_json_opts(url, etag, last_modified, true)
+    }
+
+    /// Same, never falling back to the browser channel.
+    pub fn conditional_json_no_solver(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<FetchOutcome, NetError> {
+        self.conditional_json_opts(url, etag, last_modified, false)
+    }
+
+    fn conditional_json_opts(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+        use_solver: bool,
+    ) -> Result<FetchOutcome, NetError> {
+        let mut extra: Vec<(&str, &str)> = Vec::new();
+        if let Some(value) = etag.filter(|value| !value.trim().is_empty()) {
+            extra.push(("If-None-Match", value));
+        }
+        if let Some(value) = last_modified.filter(|value| !value.trim().is_empty()) {
+            extra.push(("If-Modified-Since", value));
+        }
+        if extra.is_empty() {
+            return self
+                .download_json_with_meta_opts(url, use_solver)
+                .map(FetchOutcome::Fetched);
+        }
+        self.fetch(url, &extra, use_solver)
+    }
+
+    fn fetch(
+        &self,
+        url: &str,
+        extra: &[(&str, &str)],
+        use_solver: bool,
+    ) -> Result<FetchOutcome, NetError> {
+        let mut headers = request_headers(url);
+        headers.extend(
+            extra
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        );
         let header_refs: Vec<(&str, &str)> = headers
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -181,17 +296,31 @@ impl Downloader {
                 blocked.push(profile);
                 continue;
             }
-            return finish(response);
+            if response.status == 304 {
+                return Ok(FetchOutcome::NotModified);
+            }
+            return finish_meta(response).map(FetchOutcome::Fetched);
         }
 
         let mut solver_note = String::new();
-        if let Some(solver) = self.solver.as_ref() {
-            match solver.fetch(url) {
-                Ok(body) => return Ok(body),
-                Err(error) => {
-                    solver_note = format!("；chaser-cf 自动验证失败: {error}");
+        if use_solver {
+            if let Some(solver) = self.solver.as_ref() {
+                match solver.fetch(url) {
+                    Ok(body) => {
+                        return Ok(FetchOutcome::Fetched(Downloaded {
+                            body,
+                            etag: None,
+                            last_modified: None,
+                            via_cloudflare: true,
+                        }))
+                    }
+                    Err(error) => {
+                        solver_note = format!("；chaser-cf 自动验证失败: {error}");
+                    }
                 }
             }
+        } else {
+            solver_note = "；后台刷新不会自动打开验证浏览器，请手动刷新该源".to_string();
         }
 
         Err(NetError {
@@ -251,6 +380,7 @@ mod tests {
     struct ScriptedClient {
         responses: Mutex<Vec<Result<HttpResponse, String>>>,
         seen_profiles: Mutex<Vec<Option<String>>>,
+        seen_headers: Mutex<Vec<Vec<(String, String)>>>,
     }
 
     impl ScriptedClient {
@@ -258,7 +388,17 @@ mod tests {
             Arc::new(Self {
                 responses: Mutex::new(responses),
                 seen_profiles: Mutex::new(Vec::new()),
+                seen_headers: Mutex::new(Vec::new()),
             })
+        }
+
+        fn last_headers(&self) -> Vec<(String, String)> {
+            self.seen_headers
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
@@ -266,7 +406,7 @@ mod tests {
         fn get(
             &self,
             _url: &str,
-            _headers: &[(&str, &str)],
+            headers: &[(&str, &str)],
             _timeout: Duration,
             profile: Option<&str>,
         ) -> Result<HttpResponse, String> {
@@ -274,6 +414,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(profile.map(str::to_string));
+            self.seen_headers.lock().unwrap().push(
+                headers
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            );
             self.responses.lock().unwrap().remove(0)
         }
     }
@@ -432,5 +578,125 @@ mod tests {
         assert!(error.message.contains("chaser-cf"));
         assert!(error.message.contains("未找到 Chrome"));
         assert!(error.message.contains("从本地导入"));
+    }
+
+    #[test]
+    fn response_validators_are_kept_for_the_next_fetch() {
+        let mut ok = response(200, r#"{"downloads": []}"#);
+        ok.headers
+            .insert("etag".to_string(), "\"v7\"".to_string());
+        ok.headers.insert(
+            "last-modified".to_string(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        );
+        let downloader = Downloader::new(ScriptedClient::new(vec![Ok(ok)]));
+
+        let fetched = downloader
+            .download_json_with_meta("https://mirror.example/list.json")
+            .unwrap();
+        assert_eq!(fetched.body, r#"{"downloads": []}"#);
+        assert_eq!(fetched.etag.as_deref(), Some("\"v7\""));
+        assert_eq!(
+            fetched.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        );
+        assert!(!fetched.via_cloudflare);
+    }
+
+    #[test]
+    fn conditional_request_sends_both_validators() {
+        let client = ScriptedClient::new(vec![Ok(response(304, ""))]);
+        let downloader = Downloader::new(client.clone());
+        let outcome = downloader
+            .conditional_json(
+                "https://mirror.example/list.json",
+                Some("\"v7\""),
+                Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+            )
+            .unwrap();
+
+        assert!(matches!(outcome, FetchOutcome::NotModified));
+        let headers = client.last_headers();
+        assert!(headers
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case("if-none-match") && value == "\"v7\""));
+        assert!(headers.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("if-modified-since")
+                && value == "Wed, 21 Oct 2026 07:28:00 GMT"
+        }));
+        assert!(
+            client.seen_profiles.lock().unwrap().len() == 1,
+            "a 304 is not a challenge, so no retry"
+        );
+    }
+
+    #[test]
+    fn a_server_ignoring_validators_still_yields_the_body() {
+        let mut ok = response(200, r#"{"downloads": [1]}"#);
+        ok.headers.insert("etag".to_string(), "\"v8\"".to_string());
+        let downloader = Downloader::new(ScriptedClient::new(vec![Ok(ok)]));
+
+        match downloader
+            .conditional_json("https://mirror.example/list.json", Some("\"v7\""), None)
+            .unwrap()
+        {
+            FetchOutcome::Fetched(fetched) => {
+                assert_eq!(fetched.body, r#"{"downloads": [1]}"#);
+                assert_eq!(fetched.etag.as_deref(), Some("\"v8\""));
+            }
+            FetchOutcome::NotModified => panic!("expected a fresh body"),
+        }
+    }
+
+    #[test]
+    fn a_conditional_request_without_validators_is_a_plain_download() {
+        let client = ScriptedClient::new(vec![Ok(response(200, r#"{"downloads": []}"#))]);
+        let downloader = Downloader::new(client.clone());
+
+        let outcome = downloader
+            .conditional_json("https://mirror.example/list.json", None, Some("  "))
+            .unwrap();
+        assert!(matches!(outcome, FetchOutcome::Fetched(_)));
+        assert!(!client
+            .last_headers()
+            .iter()
+            .any(|(key, _)| key.to_lowercase().starts_with("if-")));
+    }
+
+    #[test]
+    fn passive_fetch_never_starts_the_browser_channel() {
+        let client = ScriptedClient::new(vec![
+            Ok(challenge()),
+            Ok(challenge()),
+            Ok(challenge()),
+        ]);
+        let solver = FakeSolver::new(vec![Ok(r#"{"downloads": []}"#.to_string())]);
+        let downloader = Downloader::with_solver(client.clone(), solver.clone());
+
+        let error = downloader
+            .conditional_json_no_solver("https://mirror.example/list.json", None, None)
+            .unwrap_err();
+
+        assert!(error.is_cloudflare());
+        assert!(error.message.contains("后台刷新不会自动打开验证浏览器"));
+        assert!(solver.calls.lock().unwrap().is_empty());
+        assert_eq!(client.seen_profiles.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cloudflare_bodies_carry_no_validators() {        let client = ScriptedClient::new(vec![
+            Ok(challenge()),
+            Ok(challenge()),
+            Ok(challenge()),
+        ]);
+        let solver = FakeSolver::new(vec![Ok(r#"{"downloads": []}"#.to_string())]);
+        let downloader = Downloader::with_solver(client, solver);
+
+        let fetched = downloader
+            .download_json_with_meta("https://mirror.example/list.json")
+            .unwrap();
+        assert!(fetched.via_cloudflare);
+        assert!(fetched.etag.is_none());
+        assert!(fetched.last_modified.is_none());
     }
 }

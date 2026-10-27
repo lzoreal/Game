@@ -14,8 +14,9 @@ use serde_json::Value;
 
 use crate::dates::{format_date, parse_upload_date};
 use crate::model::{Group, Item, SourceMeta};
+use crate::search::ParsedQuery;
 use crate::storage;
-use crate::text::{dedup_key, display_name, normalize_text};
+use crate::text::{dedup_key, display_name};
 
 pub const MAX_RESULTS: usize = 1000;
 pub const LATEST_LIMIT: usize = 100;
@@ -353,6 +354,9 @@ pub fn finalize_group(mut items: Vec<Item>, score: f64) -> Group {
     let newest = newest.unwrap_or(0);
 
     let title = items[rep].title.to_string();
+    // The group identity is the normalized title of a member, not the 64-bit
+    // hash. Every member shares the same dedup key, so any of them will do.
+    let key = dedup_key(&items[rep].title);
     let size = items[newest].file_size.to_string();
     let date_str = items[newest].upload_date.to_string();
     let date_dt = items[newest].date_dt;
@@ -381,6 +385,7 @@ pub fn finalize_group(mut items: Vec<Item>, score: f64) -> Group {
 
     Group {
         title,
+        key,
         sources,
         size,
         date_str,
@@ -427,17 +432,15 @@ fn add_hit(
 
 pub fn search_items(
     items: &[Item],
-    query: &str,
+    parsed: &ParsedQuery,
     fuzzy: bool,
     min_similarity: f64,
     source_filter: &str,
     limit: usize,
 ) -> (Vec<Group>, usize) {
-    let q = normalize_text(query);
-    if q.is_empty() {
+    let Some(q) = parsed.needle() else {
         return (Vec::new(), 0);
-    }
-
+    };
     let mut buckets: HashMap<u64, Bucket> = HashMap::new();
     let mut order: Vec<u64> = Vec::new();
     let mut substring_hits = 0usize;
@@ -446,8 +449,11 @@ pub fn search_items(
         if !source_filter.is_empty() && item.source_display.as_ref() != source_filter {
             continue;
         }
-        let Some(pos) = item.nt.find(&q) else { continue };
-        let score = if item.nt.as_ref() == q.as_str() {
+        if !parsed.matches(&item.nt) {
+            continue;
+        }
+        let Some(pos) = item.nt.find(q) else { continue };
+        let score = if item.nt.as_ref() == q {
             1.0
         } else {
             let coverage = q.chars().count() as f64 / item.nt.chars().count().max(1) as f64;
@@ -468,8 +474,11 @@ pub fn search_items(
             if !source_filter.is_empty() && item.source_display.as_ref() != source_filter {
                 continue;
             }
+            if !parsed.matches(&item.nt) {
+                continue;
+            }
             let nt = &item.nt;
-            if nt.contains(&q) {
+            if nt.contains(q) {
                 continue;
             }
             if qcompact.chars().count() >= 3 && !nt.contains(&head) {
@@ -479,7 +488,7 @@ pub fn search_items(
             if qchars.intersection(&tchars).count() < min_shared {
                 continue;
             }
-            let score = 0.9 * sequence_ratio(&q, nt);
+            let score = 0.9 * sequence_ratio(q, nt);
             if score >= min_similarity {
                 add_hit(&mut buckets, &mut order, item, score);
             }
@@ -664,11 +673,12 @@ pub fn source_path(dir: &Path, name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::parse_query;
 
     fn item(title: &str, source: &str, date: &str, uri: &str) -> Item {
         Item {
             title: title.to_string().into_boxed_str(),
-            nt: normalize_text(title).into_boxed_str(),
+            nt: crate::text::normalize_text(title).into_boxed_str(),
             key_id: group_key_id(&dedup_key(title)),
             uris: vec![uri.to_string().into_boxed_str()],
             file_size: "1 GB".into(),
@@ -688,13 +698,15 @@ mod tests {
             item("Hades v1.1", "b", "2024-02-01", "magnet:b"),
             item("Other Game", "a", "2024-01-01", "magnet:c"),
         ];
-        let (groups, total) = search_items(&items, "hades", true, 0.3, "", 10);
+        let (groups, total) = search_items(&items, &parse_query("hades"), true, 0.3, "", 10);
         assert_eq!(total, 1);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].title, "Hades v1.0");
         assert_eq!(groups[0].sources, vec!["a", "b"]);
         assert_eq!(groups[0].link_count, 2);
         assert_eq!(groups[0].date_display, "2024-02-01");
+        // Favorites are anchored to this string, never to `group_key_id`.
+        assert_eq!(groups[0].key, "hades");
     }
 
     #[test]
@@ -703,7 +715,7 @@ mod tests {
             item("Elden Ring", "a", "2024-01-01", "magnet:x"),
             item("Elden Ring Nightreign", "a", "2024-01-02", "magnet:y"),
         ];
-        let (groups, total) = search_items(&items, "elden ring", true, 0.3, "", 10);
+        let (groups, total) = search_items(&items, &parse_query("elden ring"), true, 0.3, "", 10);
         assert_eq!(total, 2);
         assert_eq!(groups[0].title, "Elden Ring");
     }
@@ -714,9 +726,46 @@ mod tests {
             item("Alpha", "a", "2024-01-01", "magnet:a"),
             item("Alpha", "b", "2024-01-01", "magnet:b"),
         ];
-        let (groups, total) = search_items(&items, "alpha", false, 0.3, "b", 10);
+        let (groups, total) = search_items(&items, &parse_query("alpha"), false, 0.3, "b", 10);
         assert_eq!(total, 1);
         assert_eq!(groups[0].sources, vec!["b"]);
+    }
+
+    #[test]
+    fn excluded_words_remove_hits_without_touching_the_score() {
+        let items = vec![
+            item("Hades", "a", "2024-01-01", "magnet:a"),
+            item("Hades 合集", "a", "2024-01-02", "magnet:b"),
+            item("Hades GOG", "a", "2024-01-03", "magnet:c"),
+        ];
+        let (groups, total) = search_items(&items, &parse_query("hades -合集 -gog"), true, 0.3, "", 10);
+        assert_eq!(total, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "Hades");
+    }
+
+    #[test]
+    fn quoted_phrases_must_appear_in_full() {
+        let items = vec![
+            item("Elden Ring Shadow of the Erdtree", "a", "2024-01-01", "magnet:a"),
+            item("Elden Ring Nightreign", "a", "2024-01-02", "magnet:b"),
+            item("Shadow of the Erdtree", "a", "2024-01-03", "magnet:c"),
+        ];
+        let (groups, total) =
+            search_items(&items, &parse_query(r#""shadow of the" erdtree"#), true, 0.3, "", 10);
+        assert_eq!(total, 2);
+        let titles: Vec<&str> = groups.iter().map(|group| group.title.as_str()).collect();
+        assert!(titles.contains(&"Elden Ring Shadow of the Erdtree"));
+        assert!(titles.contains(&"Shadow of the Erdtree"));
+        assert!(!titles.contains(&"Elden Ring Nightreign"));
+    }
+
+    #[test]
+    fn a_query_of_only_exclusions_has_no_hits() {
+        let items = vec![item("Hades", "a", "2024-01-01", "magnet:a")];
+        let (groups, total) = search_items(&items, &parse_query("-合集"), true, 0.3, "", 10);
+        assert!(groups.is_empty());
+        assert_eq!(total, 0);
     }
 
     #[test]
@@ -866,7 +915,7 @@ mod tests {
 
         for query in ["hades", "hadesz", "cyberpunk"] {
             let started = Instant::now();
-            let (groups, total) = search_items(&items, query, true, 0.3, "", 1000);
+            let (groups, total) = search_items(&items, &parse_query(query), true, 0.3, "", 1000);
             eprintln!(
                 "search {:?} {}ms groups={} total={}",
                 query,

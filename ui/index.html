@@ -22,7 +22,7 @@
 
       <div class="searchbox" id="searchBox">
         <span class="search-icon" id="searchIcon"></span>
-        <input id="searchInput" type="text" placeholder="搜索游戏名称、来源…" autocomplete="off" spellcheck="false" />
+        <input id="searchInput" type="text" placeholder="搜索游戏名称、来源…（-排除词 &quot;短语&quot;）" autocomplete="off" spellcheck="false" />
         <button id="clearSearch" class="icon-btn tiny hidden" title="清空"></button>
         <kbd class="search-kbd">Ctrl K</kbd>
       </div>
@@ -48,6 +48,25 @@
           <button class="icon-btn small" id="addSourceBtn" title="添加源"></button>
           <button class="icon-btn small" id="closeSidebarBtn" title="关闭资料库 (Ctrl+B)"></button>
         </div>
+
+        <div class="view-list" id="viewList">
+          <button class="view-row active" data-view="all">
+            <span class="view-icon" data-icon="grid"></span>
+            <span class="view-name">全部游戏</span>
+            <span class="view-count" id="viewCountAll">0</span>
+          </button>
+          <button class="view-row" data-view="favorites">
+            <span class="view-icon" data-icon="star"></span>
+            <span class="view-name">收藏</span>
+            <span class="view-count" id="viewCountFavorites">0</span>
+          </button>
+          <button class="view-row" data-view="unhandled">
+            <span class="view-icon" data-icon="check"></span>
+            <span class="view-name">未处理</span>
+            <span class="view-count" id="viewCountUnhandled">0</span>
+          </button>
+        </div>
+        <div class="sidebar-sep"></div>
 
         <div class="source-list" id="sourceList"></div>
 
@@ -82,6 +101,12 @@
             <span class="step-value" id="thresholdValue">0.3</span>
             <button class="step-btn" id="thresholdPlus">+</button>
           </div>
+          <button class="btn filter" id="handledBtn">
+            <span class="ico" data-icon="check"></span><span>显示已处理</span>
+          </button>
+          <button class="btn filter hidden" id="blockBtn" title="点击临时开启或关闭屏蔽词；在「更多」菜单里编辑">
+            <span class="ico" data-icon="check"></span><span id="blockBtnLabel">屏蔽词</span>
+          </button>
           <div class="flex-fill"></div>
           <button class="btn ghost small" id="sortBtn" title="切换上传日期排序">最新在前 ↓</button>
         </div>

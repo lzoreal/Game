@@ -35,6 +35,10 @@ pub struct SourceMeta {
 #[derive(Clone, Debug, Serialize)]
 pub struct Group {
     pub title: String,
+    /// Normalized title (`text::dedup_key`) — the stable identity used by
+    /// favorites. Never derive it from `key_id`: that hash changes whenever the
+    /// normalization rules do.
+    pub key: String,
     pub sources: Vec<String>,
     pub size: String,
     pub date_str: String,
@@ -56,16 +60,25 @@ pub struct Row {
     pub date: String,
     #[serde(rename = "linkCount")]
     pub link_count: usize,
+    pub key: String,
+    pub favorite: bool,
+    pub handled: bool,
+    /// Favorited, but the remembered link is gone from this group.
+    pub broken: bool,
 }
 
 impl Group {
-    pub fn row(&self) -> Row {
+    pub fn row(&self, favorite: bool, handled: bool, broken: bool) -> Row {
         Row {
             title: self.title.clone(),
             sources: self.sources.join(" + "),
             size: self.size.clone(),
             date: self.date_display.clone(),
             link_count: self.link_count,
+            key: self.key.clone(),
+            favorite,
+            handled,
+            broken,
         }
     }
 }

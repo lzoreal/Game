@@ -19,6 +19,7 @@ const ICONS = {
   external: '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
   check: '<path d="m5 12.5 4.2 4 9.8-10"/>',
   panel: '<rect x="4" y="5.5" width="16" height="13" rx="1.5"/><path d="M10 5.5v13"/>',
+  star: '<path d="M12 4.6l2.35 4.9 5.15.72-3.75 3.62.9 5.16L12 16.44 7.35 18.9l.9-5.16L4.5 10.22l5.15-.72z"/>',
 };
 
 function icon(name, cls = '') {
@@ -32,6 +33,13 @@ function icon(name, cls = '') {
 const $ = (id) => document.getElementById(id);
 const invoke = (...args) => window.__TAURI__.core.invoke(...args);
 const listen = (...args) => window.__TAURI__.event.listen(...args);
+
+const SORT_LABELS = {
+  favoriteDesc: '收藏顺序 ↓',
+  dateDesc: '最新在前 ↓',
+  dateAsc: '最早在前 ↑',
+  titleAsc: '名称 A→Z',
+};
 
 const html = (value) =>
   String(value == null ? '' : value)
@@ -180,8 +188,14 @@ function renderFilters() {
   if (!S) return;
   $('fuzzyBtn').classList.toggle('checked', S.fuzzy);
   $('thresholdValue').textContent = Number(S.threshold).toFixed(1);
-  $('sortBtn').textContent = S.sortDesc ? '最新在前 ↓' : '最早在前 ↑';
-  $('sortChev').classList.toggle('asc', !S.sortDesc);
+  $('sortBtn').textContent = SORT_LABELS[S.sortMode] || SORT_LABELS.dateDesc;
+  $('sortChev').classList.toggle('asc', S.sortMode === 'dateAsc');
+  $('handledBtn').classList.toggle('checked', S.showHandled);
+  $('handledBtn').classList.toggle('hidden', S.view === 'unhandled');
+  const blocked = S.blocked || [];
+  $('blockBtn').classList.toggle('hidden', blocked.length === 0);
+  $('blockBtn').classList.toggle('checked', Boolean(S.blockEnabled) && blocked.length > 0);
+  $('blockBtnLabel').textContent = blocked.length ? `屏蔽词 ${blocked.length}` : '屏蔽词';
   const input = $('searchInput');
   if (document.activeElement !== input && input.value !== S.query) input.value = S.query;
   $('clearSearch').classList.toggle('hidden', !input.value);
@@ -210,6 +224,14 @@ function renderSidebar() {
     .join('');
   $('sourceCount').textContent = Math.max(0, S.sources.length - 1);
   $('sidebar').classList.toggle('collapsed', sidebarCollapsed);
+  document.querySelectorAll('.view-row').forEach((node) => {
+    node.classList.toggle('active', node.dataset.view === S.view);
+  });
+  $('viewCountAll').textContent = formatCount(S.totalGroups);
+  $('viewCountFavorites').textContent = formatCount(S.favoriteCount);
+  $('viewCountUnhandled').textContent = formatCount(Math.max(0, S.totalGroups - S.handledCount));
+  const favoritesRow = document.querySelector('.view-row[data-view="favorites"]');
+  if (favoritesRow && S.userStatePath) favoritesRow.title = `收藏保存在 ${S.userStatePath}`;
 }
 
 function renderRows() {
@@ -222,10 +244,19 @@ function renderRows() {
   const frag = document.createDocumentFragment();
   rows.forEach((row, index) => {
     const div = document.createElement('div');
-    div.className = 'result-row' + (index % 2 === 1 ? ' alt' : '');
+    div.className = 'result-row'
+      + (index % 2 === 1 ? ' alt' : '')
+      + (row.handled ? ' handled' : '');
     div.dataset.index = String(index);
+    const starTitle = row.broken
+      ? '收藏的链接已失效，点击取消收藏'
+      : row.favorite ? '取消收藏' : '收藏';
     div.innerHTML = `
-      <div class="result-title" title="${html(row.title)}">${html(row.title)}</div>
+      <div class="cell-title">
+        <button class="row-star${row.favorite ? ' on' : ''}${row.broken ? ' broken' : ''}"
+                data-action="favorite" data-key="${html(row.key)}" title="${starTitle}">${icon('star')}</button>
+        <span class="result-title" title="${html(row.title)}">${html(row.title)}</span>
+      </div>
       <div class="cell-source"><span class="source-chip" title="${html(row.sources)}">${html(row.sources)}</span></div>
       <div class="cell-size">${html(row.size)}</div>
       <div class="cell-date">${html(row.date)}</div>
@@ -261,16 +292,37 @@ function updateEmpty() {
   empty.classList.toggle('hidden', !show);
   if (!show || !S) return;
   const loading = S.busy || S.latestLoading;
-  $('emptyTitle').textContent = loading
-    ? '正在加载游戏…'
-    : S.query.length > 0
-      ? '没有找到结果'
-      : '暂无游戏';
-  $('emptySub').textContent = loading
-    ? '首次读取全部来源可能需要几秒，请稍候。'
-    : S.query.length > 0
-      ? '试试更短的关键词，或切换来源'
-      : '添加或刷新源后，这里会显示最新的游戏。';
+  const view = S.view || 'all';
+  const searching = S.query.length > 0;
+  if (loading) {
+    $('emptyTitle').textContent = '正在加载游戏…';
+    $('emptySub').textContent = '首次读取全部来源可能需要几秒，请稍候。';
+    return;
+  }
+  if (view === 'favorites') {
+    $('emptyTitle').textContent = searching ? '收藏里没有匹配的结果' : '还没有收藏';
+    $('emptySub').textContent = searching
+      ? '清空搜索框，或换一个关键词。'
+      : '在列表里点星标，收藏的游戏会集中到这里。';
+    return;
+  }
+  const blocklistHides = Boolean(S.blockEnabled) && (S.blocked || []).length > 0 && S.totalGroups > 0;
+  if (view === 'unhandled') {
+    $('emptyTitle').textContent = searching ? '没有匹配的未处理游戏' : '都处理完了';
+    $('emptySub').textContent = searching
+      ? '清空搜索框，或换一个关键词。'
+      : '标记为已处理的游戏不会再出现在这里，可在上方打开「显示已处理」找回。';
+    return;
+  }
+  if (!searching && blocklistHides) {
+    $('emptyTitle').textContent = '屏蔽词隐藏了这些结果';
+    $('emptySub').textContent = '关闭上方「屏蔽词」按钮即可查看，或在「更多 → 屏蔽词…」里调整列表。';
+    return;
+  }
+  $('emptyTitle').textContent = searching ? '没有找到结果' : '暂无游戏';
+  $('emptySub').textContent = searching
+    ? '试试更短的关键词，或切换来源'
+    : '添加或刷新源后，这里会显示最新的游戏。';
 }
 
 /* ------------------------------------------------------------- detail */
@@ -301,6 +353,12 @@ function renderDetail(keepScroll = false) {
 
   const chords = detail.sources.map((source) => `<span class="chip">${html(source)}</span>`).join('');
   const cards = detail.cards.map(renderCard).join('');
+  const compare = renderCompare(detail.compare);
+  const broken = detail.broken
+    ? '<div class="detail-warn">收藏的链接已失效，请从下方重新选择一条。</div>'
+    : '';
+  const favoriteLabel = detail.favorite ? '已收藏' : '收藏';
+  const handledLabel = detail.handled ? '已处理' : '标记已处理';
   const rawSection = rawOpen
     ? `<pre class="raw-block">${html(detail.raw || '')}</pre>`
     : rawLoading
@@ -317,8 +375,14 @@ function renderDetail(keepScroll = false) {
     <div class="chips">${chords}</div>
     <div class="detail-meta">${html(detail.meta)}</div>
     <div class="detail-actions">
+      <button class="btn ${detail.favorite ? 'primary' : 'soft'}" data-action="toggle-favorite"
+              data-key="${html(detail.key)}">${icon('star')}<span>${favoriteLabel}</span></button>
+      <button class="btn ${detail.handled ? 'primary' : 'soft'}" data-action="toggle-handled"
+              data-key="${html(detail.key)}">${icon('check')}<span>${handledLabel}</span></button>
       <button class="btn soft" data-action="copy-all">${icon('copy')}<span>复制全部</span></button>
     </div>
+    ${broken}
+    ${compare}
     ${cards}
     <button class="raw-toggle${rawOpen ? ' open' : ''}" data-action="toggle-raw">
       <span>${rawLabel}</span>
@@ -326,6 +390,29 @@ function renderDetail(keepScroll = false) {
     </button>
     ${rawSection}`;
   body.scrollTop = previousScroll;
+}
+
+function renderCompare(compare) {
+  if (!compare || compare.length < 2) return '';
+  const rows = compare
+    .map((row) => `
+      <tr class="${row.chosen ? 'chosen' : ''}">
+        <td>${row.chosen ? '<span class="chosen-dot" title="收藏时选中的条目"></span>' : ''}${html(row.source)}</td>
+        <td>${html(row.size)}</td>
+        <td>${html(row.date)}</td>
+      </tr>`)
+    .join('');
+  return `
+    <div class="compare">
+      <div class="compare-head">
+        <span>来源对比</span>
+        <span class="count">${compare.length}</span>
+      </div>
+      <table class="compare-table">
+        <thead><tr><th>来源</th><th>大小</th><th>日期</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
 }
 
 function renderCard(card) {
@@ -433,6 +520,14 @@ function bindStatic() {
   });
   $('sortBtn').addEventListener('click', () => invoke('toggle_sort'));
   $('dateHeader').addEventListener('click', () => invoke('toggle_sort'));
+  $('handledBtn').addEventListener('click', () => invoke('set_show_handled', { enabled: !(S && S.showHandled) }));
+  $('blockBtn').addEventListener('click', () => invoke('set_block_enabled', { enabled: !(S && S.blockEnabled) }));
+
+  $('viewList').addEventListener('click', (event) => {
+    const row = event.target.closest('.view-row');
+    if (!row) return;
+    invoke('set_view', { view: row.dataset.view });
+  });
 
   $('expandDetailsBtn').addEventListener('click', () => setDetails(true));
   $('closeDetailBtn').addEventListener('click', () => setDetails(false));
@@ -451,6 +546,12 @@ function bindStatic() {
   });
 
   $('rows').addEventListener('click', (event) => {
+    const star = event.target.closest('[data-action="favorite"]');
+    if (star) {
+      event.stopPropagation();
+      invoke('toggle_favorite', { key: star.dataset.key });
+      return;
+    }
     const row = event.target.closest('.result-row');
     if (!row) return;
     invoke('select_result', { index: Number(row.dataset.index) });
@@ -482,6 +583,8 @@ function onDetailClick(event) {
   if (!button) return;
   const action = button.dataset.action;
   if (action === 'copy-all') invoke('copy_current_links');
+  else if (action === 'toggle-favorite') invoke('toggle_favorite', { key: button.dataset.key });
+  else if (action === 'toggle-handled') invoke('toggle_handled', { key: button.dataset.key });
   else if (action === 'toggle-raw') {
     if (rawLoading) return;
     const scroll = $('detailBody').scrollTop;
@@ -622,6 +725,7 @@ function showMoreMenu(x, y) {
     { label: '打开源文件夹', onClick: () => invoke('open_sources_folder') },
     { separator: true },
     { label: '聚焦搜索框', onClick: () => { $('searchInput').focus(); $('searchInput').select(); } },
+    { label: '屏蔽词…', onClick: showBlocklistDialog },
     { label: (sidebarOpen ? '隐藏' : '显示') + '资料库', onClick: toggleSidebar },
     { separator: true },
     { label: '常见 BT 客户端…', onClick: showBtClientsDialog },
@@ -754,6 +858,14 @@ function openModal({ title, sub, body, bodyClass = 'modal-body', fields = [], ch
     const bodyEl = document.createElement('div');
     bodyEl.className = bodyClass;
     bodyEl.innerHTML = body;
+    // Template literals indent top-level blocks with newlines and spaces. The
+    // body uses pre-wrap (so plain-text errors keep their line breaks), which
+    // renders those gaps as blank lines — 40px instead of the intended margins.
+    if (bodyEl.children.length) {
+      [...bodyEl.childNodes].forEach((node) => {
+        if (node.nodeType === Node.TEXT_NODE && !node.textContent.trim()) node.remove();
+      });
+    }
     modal.appendChild(bodyEl);
   }
 
@@ -774,7 +886,7 @@ function openModal({ title, sub, body, bodyClass = 'modal-body', fields = [], ch
   modal.appendChild(actionsRow);
 
   layer.append(backdrop, modal);
-  const first = modal.querySelector('input');
+  const first = modal.querySelector('textarea, input');
   if (first) setTimeout(() => first.focus(), 10);
   return { inputs };
 }
@@ -828,6 +940,50 @@ function showUpdateSourceDialog() {
         label: '开始更新',
         kind: 'primary',
         onClick: (inputs) => invoke('request_update_source', { url: inputs.url.value }),
+      },
+    ],
+  });
+}
+
+function showBlocklistDialog() {
+  const blocked = (S && S.blocked) || [];
+  const enabled = Boolean(S && S.blockEnabled);
+  openModal({
+    title: '屏蔽词',
+    sub: '标题包含任意一行时隐藏该条目（不区分大小写）',
+    fields: [
+      {
+        id: 'terms',
+        type: 'textarea',
+        rows: 9,
+        value: blocked.join(String.fromCharCode(10)),
+        placeholder: '每行一个词，例如：合集\n整合\nGOG',
+      },
+    ],
+    checkboxes: [
+      {
+        id: 'enabled',
+        label: '启用屏蔽（关闭后保留列表，只是暂时不过滤）',
+        checked: enabled,
+      },
+    ],
+    actions: [
+      { label: '取消', kind: 'soft' },
+      {
+        label: '保存',
+        kind: 'primary',
+        onClick: (ctx) => {
+          const terms = ctx.terms.value
+            .split(String.fromCharCode(10))
+            .map((line) => line.trim())
+            .filter(Boolean);
+          const want = ctx.enabled.checked;
+          // Saving a non-empty list turns filtering on, so only an explicit
+          // "off" needs a second call.
+          invoke('set_blocklist', { terms }).then(() => {
+            if (!want) invoke('set_block_enabled', { enabled: false });
+          });
+        },
       },
     ],
   });
@@ -934,7 +1090,8 @@ function showBtClientsDialog() {
     title: '常见 BT 客户端',
     sub: '以下链接均指向官方下载页。安装时请留意捆绑组件。',
     width: 'wide',
-    body: `<div style="display:flex;flex-direction:column;gap:8px;background:transparent;border:0;padding:0;max-height:52vh">${rows}</div>`,
+    body: rows,
+    bodyClass: 'modal-client-list',
     actions: [{ label: '关闭', kind: 'primary' }],
   });
   const layer = $('modalLayer');

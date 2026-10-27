@@ -15,6 +15,7 @@ pub mod storage;
 pub mod swarm;
 pub mod text;
 pub mod update;
+pub mod user;
 
 use std::sync::Arc;
 
@@ -104,6 +105,12 @@ pub fn run() {
             ipc::set_threshold,
             ipc::select_source,
             ipc::toggle_sort,
+            ipc::set_view,
+            ipc::set_show_handled,
+            ipc::toggle_favorite,
+            ipc::toggle_handled,
+            ipc::set_blocklist,
+            ipc::set_block_enabled,
             ipc::select_result,
             ipc::copy_current_links,
             ipc::request_detail_raw,

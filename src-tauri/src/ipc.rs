@@ -64,6 +64,36 @@ pub fn toggle_sort(state: State<'_, SharedState>) {
 }
 
 #[tauri::command]
+pub fn set_view(state: State<'_, SharedState>, view: String) {
+    shared(&state).set_view(&view);
+}
+
+#[tauri::command]
+pub fn set_show_handled(state: State<'_, SharedState>, enabled: bool) {
+    shared(&state).set_show_handled(enabled);
+}
+
+#[tauri::command]
+pub fn toggle_favorite(state: State<'_, SharedState>, key: String) {
+    shared(&state).toggle_favorite(&key);
+}
+
+#[tauri::command]
+pub fn toggle_handled(state: State<'_, SharedState>, key: String) {
+    shared(&state).toggle_handled(&key);
+}
+
+#[tauri::command]
+pub fn set_blocklist(state: State<'_, SharedState>, terms: Vec<String>) {
+    shared(&state).set_blocklist(terms);
+}
+
+#[tauri::command]
+pub fn set_block_enabled(state: State<'_, SharedState>, enabled: bool) {
+    shared(&state).set_block_enabled(enabled);
+}
+
+#[tauri::command]
 pub fn select_result(state: State<'_, SharedState>, index: i64) {
     shared(&state).select_result(index);
 }
